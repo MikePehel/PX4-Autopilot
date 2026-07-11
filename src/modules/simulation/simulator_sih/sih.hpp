@@ -80,11 +80,13 @@
 #include <uORB/topics/actuator_outputs.h>
 #include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/esc_status.h>
+#include <uORB/topics/obstacle_distance.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_global_position.h>
+#include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/ranging_beacon.h>
 
@@ -155,8 +157,21 @@ private:
 	uORB::Publication<ranging_beacon_s>   _ranging_beacon_pub{ORB_ID(ranging_beacon)};
 	uORB::Publication<esc_status_s>       _esc_status_pub{ORB_ID(esc_status)};
 
-	// Subscribed for the disarm-edge reset_vehicle_state() trigger.
+	// Obstacle ring: one simulated scanning lidar. Persistent 72-bin cache
+	// so each 10 Hz publish carries the freshest full-ring snapshot even
+	// though only OBST_BINS_PER_CYCLE bins are recomputed per cycle
+	// (spinning-lidar simulation). Consumed by CollisionPrevention.
+	uORB::Publication<obstacle_distance_s> _obstacle_distance_pub{ORB_ID(obstacle_distance)};
+	uint16_t _obst_bin_cache[72] {};
+	uint8_t  _obst_sweep_offset{0};
+	// 36 bins/cycle at 10 Hz sweeps the full 72-bin ring every 0.2 s (a
+	// ~5 Hz spinning lidar). Each bin is one sdf_sphere_trace; the
+	// worst-case cycle cost stays inside the M7 real-time budget.
+	static constexpr uint8_t OBST_BINS_PER_CYCLE = 36;
+
+	// Gates the obstacle ring: only meaningful for CollisionPrevention.
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
+	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 
 	// groundtruth
 	uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -224,6 +239,7 @@ private:
 	void reconstruct_sensors_signals(const hrt_abstime &time_now_us);
 	void send_airspeed(const hrt_abstime &time_now_us);
 	void send_dist_snsr(const hrt_abstime &time_now_us);
+	void send_obstacle_distance(const hrt_abstime &time_now_us);
 	void send_ranging_beacon(const hrt_abstime &time_now_us);
 	void publish_ground_truth(const hrt_abstime &time_now_us);
 	void generate_fw_aerodynamics(const float roll_cmd, const float pitch_cmd, const float yaw_cmd, const float thrust_for_prowash);
@@ -247,10 +263,16 @@ private:
 	perf_counter_t _loop_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")};
 	perf_counter_t _loop_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": cycle interval")};
 
+	// Worst-case-cycle counter on the obstacle_distance publish path so a
+	// 60 s SITL run can be verified against the Cortex-M7 5 ms-per-cycle
+	// budget. Read via `perf_print_all` on the NSH console.
+	perf_counter_t _send_obstacle_distance_perf{nullptr};
+
 	hrt_abstime _last_run{0};
 	hrt_abstime _last_actuator_output_time{0};
 	hrt_abstime _airspeed_time{0};
 	hrt_abstime _dist_snsr_time{0};
+	hrt_abstime _obst_distance_time{0};
 	hrt_abstime _ranging_beacon_time{0};
 	uint8_t _ranging_beacon_idx{0};
 
@@ -369,6 +391,8 @@ private:
 		(ParamFloat<px4::params::SIH_TERR_FREQ>) _sih_terr_freq,
 		(ParamInt<px4::params::SIH_TERR_SEED>) _sih_terr_seed,
 		(ParamFloat<px4::params::SIH_TERR_PLANE>) _sih_terr_plane,
+		(ParamBool<px4::params::SIH_OBST_EN>) _sih_obst_en,
+		(ParamFloat<px4::params::SIH_OBST_MAX>) _sih_obst_max,
 		(ParamFloat<px4::params::SIH_GROUND_K>) _sih_ground_k,
 		(ParamFloat<px4::params::SIH_GROUND_C>) _sih_ground_c,
 		(ParamFloat<px4::params::SIH_GROUND_MU>) _sih_ground_mu,

@@ -62,12 +62,14 @@ Sih::Sih() :
 	ModuleParams(nullptr)
 {
 	srand(1234); // initialize the random seed once before calling generate_wgn()
+	_send_obstacle_distance_perf = perf_alloc(PC_ELAPSED, MODULE_NAME": obst_dist");
 }
 
 Sih::~Sih()
 {
 	perf_free(_loop_perf);
 	perf_free(_loop_interval_perf);
+	perf_free(_send_obstacle_distance_perf);
 }
 
 void Sih::run()
@@ -248,6 +250,12 @@ void Sih::sensor_step()
 	    && fabs(_distance_snsr_override) < 10000) {
 		_dist_snsr_time = now;
 		send_dist_snsr(now);
+	}
+
+	// obstacle ring published at 10 Hz
+	if (now - _obst_distance_time >= 100_ms) {
+		_obst_distance_time = now;
+		send_obstacle_distance(now);
 	}
 
 	// ranging beacon published at 2 Hz (each beacon at 0.5 Hz)
@@ -1022,6 +1030,89 @@ void Sih::send_dist_snsr(const hrt_abstime &time_now_us)
 
 		_px4_rangefinder[i].update(now, t_hit, static_cast<int8_t>(quality));
 	}
+}
+
+void Sih::send_obstacle_distance(const hrt_abstime &time_now_us)
+{
+	perf_begin(_send_obstacle_distance_perf);
+
+	if (!_sih_obst_en.get()) {
+		perf_end(_send_obstacle_distance_perf);
+		return;
+	}
+
+	// Produce-when-consumed gate. The obstacle ring is only read by
+	// CollisionPrevention, which runs in manual position control (POSCTL)
+	// and only while flying. Skipping it when disarmed/landed or in other
+	// modes avoids synthesising a sensor stream nobody reads.
+	vehicle_control_mode_s control_mode{};
+	_vehicle_control_mode_sub.copy(&control_mode);
+	vehicle_land_detected_s land_detected{};
+	_vehicle_land_detected_sub.copy(&land_detected);
+
+	const bool cp_active = control_mode.flag_armed
+			       && control_mode.flag_control_position_enabled
+			       && control_mode.flag_control_manual_enabled;
+
+	if (!cp_active || land_detected.landed) {
+		perf_end(_send_obstacle_distance_perf);
+		return;
+	}
+
+	const float max_t = _sih_obst_max.get();
+	const float origin_n = _lpos(0);
+	const float origin_e = _lpos(1);
+	const float origin_alt = -_lpos(2);
+	const uint16_t max_cm = static_cast<uint16_t>(max_t * 100.f);
+
+	for (uint8_t i = 0; i < OBST_BINS_PER_CYCLE; i++) {
+		const uint8_t bin = (_obst_sweep_offset + i) % 72;
+		const float angle_rad = math::radians(bin * 5.f);
+
+		// Body FRD, bin 0 = vehicle forward, sweep clockwise per MAVLink
+		// OBSTACLE_DISTANCE convention. `_q` (body -> NED) rotates into the
+		// NED Z-down direction; the sphere tracer's `sdf_vec3` uses
+		// altitude-up, so flip Z at the boundary.
+		const Vector3f body_dir(cosf(angle_rad), sinf(angle_rad), 0.f);
+		const Vector3f world_dir = _q.rotateVector(body_dir);
+
+		const sdf_vec3 sdf_origin = {origin_n, origin_e, origin_alt};
+		const sdf_vec3 sdf_dir    = {world_dir(0), world_dir(1), -world_dir(2)};
+		const float t = sdf_sphere_trace(sdf_origin, sdf_dir, max_t);
+
+		if (t < 0.f) {
+			// Origin-inside-geometry sentinel: vehicle is clipping geometry
+			// in this bin's direction; report saturated-near.
+			_obst_bin_cache[bin] = 0;
+
+		} else if (t >= max_t) {
+			// `max_distance + 1` is the "no obstacle in range" marker per
+			// ObstacleDistance.msg; consumers treat it as "bin clear".
+			_obst_bin_cache[bin] = static_cast<uint16_t>(max_cm + 1);
+
+		} else {
+			_obst_bin_cache[bin] = static_cast<uint16_t>(t * 100.f);
+		}
+	}
+
+	_obst_sweep_offset = (_obst_sweep_offset + OBST_BINS_PER_CYCLE) % 72;
+
+	obstacle_distance_s msg{};
+	msg.timestamp = time_now_us;
+	msg.frame = obstacle_distance_s::MAV_FRAME_BODY_FRD;
+	msg.sensor_type = obstacle_distance_s::MAV_DISTANCE_SENSOR_LASER;
+	msg.increment = 5.0f;
+	msg.angle_offset = 0.0f;
+	msg.min_distance = 1;
+	msg.max_distance = max_cm;
+
+	static_assert(sizeof(msg.distances) == 72 * sizeof(uint16_t),
+		      "obstacle_distance.distances width changed upstream");
+	memcpy(msg.distances, _obst_bin_cache, sizeof(msg.distances));
+
+	_obstacle_distance_pub.publish(msg);
+
+	perf_end(_send_obstacle_distance_perf);
 }
 
 void Sih::send_ranging_beacon(const hrt_abstime &time_now_us)

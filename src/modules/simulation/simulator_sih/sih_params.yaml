@@ -360,6 +360,42 @@ parameters:
       decimal: 1
       increment: 1.0
     # Obstacle ring
+    SIH_OBST_EN:
+      description:
+        short: Obstacle ring master enable
+        long: |-
+          When enabled, the SIH module publishes the obstacle_distance uORB
+          topic at 10 Hz, populated by raycasting a 72-bin horizontal ring
+          (5 deg spacing) in the vehicle body frame against the procedural
+          terrain. 36 bins are refreshed per cycle so the full ring updates
+          every 0.2 s, mimicking a 5 Hz spinning lidar.
+
+          The published topic feeds the MAVLink OBSTACLE_DISTANCE stream and
+          the collision_prevention library. When disabled (default), no
+          obstacle_distance message is published and behavior is
+          byte-identical to SIH without the obstacle ring.
+      type: boolean
+      default: 0
+    SIH_OBST_MAX:
+      description:
+        short: Obstacle ring max raycast range
+        long: |-
+          Maximum range, in metres, used when raycasting each bin of the
+          obstacle ring. A bin that does not intersect the terrain within
+          this range publishes the no-obstacle marker (max_distance + 1)
+          so consumers such as collision_prevention can distinguish
+          "clear" from "saturated" returns.
+
+          Larger values widen the look-ahead at modest CPU cost (one extra
+          raycast step per bin per cycle); smaller values keep the ring
+          local to the vehicle.
+      type: float
+      default: 50.0
+      unit: m
+      min: 1.0
+      max: 200.0
+      decimal: 1
+      increment: 1.0
     # Ground contact (slope dynamics)
     SIH_GROUND_K:
       description:
