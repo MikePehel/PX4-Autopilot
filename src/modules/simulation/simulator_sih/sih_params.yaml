@@ -242,6 +242,174 @@ parameters:
       type: float
       default: -1.0
       unit: m
+    SIH_DISTSNSR_DIR:
+      description:
+        short: Distance sensor orientations bitmask
+        long: |-
+          Bitmask of enabled simulated distance sensor orientations. Each set bit
+          publishes an independent distance_sensor instance whose beam direction
+          matches the named MAV_SENSOR_ORIENTATION_*. SIH_DISTSNSR_MIN, MAX, and
+          OVR apply to every enabled instance.
+
+          The default (bit 0 only = downward) preserves the legacy single-instance
+          behavior. Forward/side/up beams are opt-in.
+
+          Note: PX4 param names are capped at 16 characters, so this is named
+          SIH_DISTSNSR_DIR rather than the spec-proposed SIH_DISTSNSR_ORIENT.
+      type: bitmask
+      bit:
+        0: Downward (MAV_SENSOR_ROTATION_PITCH_270)
+        1: Forward (MAV_SENSOR_ROTATION_NONE)
+        2: Left (MAV_SENSOR_ROTATION_YAW_270)
+        3: Right (MAV_SENSOR_ROTATION_YAW_90)
+        4: Upward (MAV_SENSOR_ROTATION_PITCH_90)
+      default: 1
+      min: 0
+      max: 31
+    SIH_TERR_EN:
+      description:
+        short: Terrain mode selector (off / fBm terrain / walls)
+        long: |-
+          Selects one of three mutually exclusive ground modes. Both the
+          fBm terrain (mode 1) and the wall lattice (mode 2) share the
+          hash primitive in lib/terrain via SIH_TERR_SEED, but only one
+          materialises at a time.
+
+            0 = off. Flat ground at z = 0. No walls. Behavior is
+                byte-identical to SIH without the terrain feature.
+            1 = terrain. terrain(N, E) returns fBm height driven by
+                SIH_TERR_AMP (peak amplitude) and SIH_TERR_FREQ (base
+                spatial frequency). No walls in the SDF scene.
+            2 = walls. Flat ground at z = 0 plus a procedural wall
+                lattice: cells in a fixed grid around home are
+                independently hashed and each occupied cell produces a
+                vertical wall whose dimensions and yaw come from the
+                cell's hash. SIH_TERR_AMP is ignored in this mode.
+
+          The active mode is visible to the obstacle ring (SIH_OBST_EN)
+          and to the forward/side/up distance sensors (SIH_DISTSNSR_DIR)
+          via the same SDF sphere tracer.
+
+          SIH_TERR_PLANE is honoured independently of this selector: a
+          non-zero slope angle engages planar mode regardless of the
+          ground mode.
+      type: int32
+      default: 0
+      min: 0
+      max: 2
+      values:
+        0: Off (flat ground)
+        1: Terrain (fBm hills)
+        2: Walls (flat ground + wall lattice)
+    SIH_TERR_AMP:
+      description:
+        short: Terrain peak-to-peak amplitude
+        long: |-
+          Vertical amplitude of the procedural terrain. 0 reproduces a flat
+          surface even when SIH_TERR_EN is on (useful for differential
+          regression tests).
+      type: float
+      default: 0.0
+      unit: m
+      min: 0.0
+      max: 2000.0
+      decimal: 2
+      increment: 1.0
+    SIH_TERR_FREQ:
+      description:
+        short: Terrain base spatial frequency (1/m)
+      type: float
+      default: 0.005
+      min: 0.0001
+      max: 0.1
+      decimal: 4
+      increment: 0.0005
+    SIH_TERR_SEED:
+      description:
+        short: Terrain hash seed (same seed -> same world)
+      type: int32
+      default: 0
+    SIH_TERR_PLANE:
+      description:
+        short: Deterministic planar-terrain slope (deg)
+        long: |-
+          Selects between procedural fBm terrain (default) and a deterministic
+          uniform-slope half-plane.
+
+          When 0, terrain remains the procedural fBm field driven by
+          SIH_TERR_AMP / FREQ / SEED (and the wall lattice is materialised
+          independently if SIH_TERR_EN is on).
+
+          When non-zero, terrain becomes a planar half-space tilted toward
+          the +N axis at the given angle:
+              terrain(N, E)          =  tan(angle) * N
+              terrain_gradient(N, E) =  (tan(angle), 0)
+          terrain(0, 0) = 0 is preserved by construction so the vehicle
+          still spawns at the home reference altitude. Heading is fixed at
+          +N for now (heading is a future-extension knob).
+
+          Honoured independently of SIH_TERR_EN — planar slope and the
+          wall lattice are orthogonal features. Intended for acceptance
+          tests that need a uniform slope across the landing-gear footprint
+          (the sloped-tip acceptance test).
+      type: float
+      default: 0.0
+      unit: deg
+      min: -89.0
+      max: 89.0
+      decimal: 1
+      increment: 1.0
+    # Obstacle ring
+    # Ground contact (slope dynamics)
+    SIH_GROUND_K:
+      description:
+        short: Ground contact normal stiffness (N/m, per gear)
+      type: float
+      default: 1000.0
+      min: 100.0
+      max: 1000000.0
+      decimal: 0
+      increment: 100.0
+    SIH_GROUND_C:
+      description:
+        short: Ground contact normal damping (per gear, set to ~2*sqrt(K*M/4))
+      type: float
+      default: 32.0
+      unit: N/(m/s)
+      min: 0.0
+      max: 10000.0
+      decimal: 0
+      increment: 1.0
+    SIH_GROUND_MU:
+      description:
+        short: Ground contact Coulomb friction coefficient
+        long: |-
+          Dimensionless Coulomb friction coefficient applied in the
+          tangent plane at each gear contact point. The tangential
+          friction force is capped at mu * |F_normal_gear|; below that
+          cap the contact is static (gear does not slide), above it
+          dynamic friction opposes the local tangential velocity.
+
+          Typical values: 0.3 ≈ rubber on wet asphalt, 0.5 ≈ rubber on
+          grass (default), 1.0+ ≈ rubber on dry rubber. Set to 0 to
+          disable friction (pure normal contact, vehicle slides freely
+          on slopes).
+      type: float
+      default: 0.5
+      min: 0.0
+      max: 2.0
+      decimal: 2
+      increment: 0.05
+    SIH_GEAR_Z:
+      description:
+        short: Landing-gear vertical offset below CoM (m); 0 disables contact torque
+      type: float
+      default: 0.10
+      unit: m
+      min: 0.0
+      max: 1.0
+      decimal: 2
+      increment: 0.05
     SIH_T_TAU:
       description:
         short: thruster time constant tau

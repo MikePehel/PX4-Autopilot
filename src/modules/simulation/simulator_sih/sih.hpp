@@ -68,8 +68,12 @@
 #include <lib/drivers/rangefinder/PX4Rangefinder.hpp>
 #include <lib/geo/geo.h>
 #include <lib/lat_lon_alt/lat_lon_alt.hpp>
+#include <lib/terrain/terrain.h>
+#include <lib/terrain_sdf/scene.h>
+#include <lib/terrain_sdf/terrain_sdf.h>
 #include <lib/perf/perf_counter.h>
 #include <uORB/Publication.hpp>
+#include <uORB/PublicationMulti.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionInterval.hpp>
 #include <uORB/topics/airspeed.h>
@@ -79,6 +83,7 @@
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
+#include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_global_position.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/ranging_beacon.h>
@@ -129,10 +134,29 @@ private:
 	// simulated sensors
 	PX4Accelerometer _px4_accel{1310988}; // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
 	PX4Gyroscope     _px4_gyro{1310988};  // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
-	PX4Rangefinder   _px4_rangefinder{10092548}; // 10092548: DRV_DIST_DEVTYPE_SIM, BUS: 0, ADDR: 0, TYPE: SIMULATION
+	// One PX4Rangefinder per enabled SIH_DISTSNSR_DIR bit (down/fwd/left/
+	// right/up). Publishing through the driver wrapper (rather than raw
+	// distance_sensor) matches the rest of SIH's sensors and lets each
+	// beam inherit the wrapper's device-id / rotation handling. The
+	// downward beam (bit 0) keeps the legacy sim device id (10092548:
+	// DRV_DIST_DEVTYPE_SIM, BUS 0, ADDR 0); the others offset the address
+	// field so each advertises its own distance_sensor instance. Consumers
+	// (EKF2 terrain, CollisionPrevention) filter by orientation, so the
+	// beams are independent — the side beams are opt-in via SIH_DISTSNSR_DIR.
+	static constexpr uint8_t NUM_DISTSNSR_INSTANCES = 5;
+	PX4Rangefinder _px4_rangefinder[NUM_DISTSNSR_INSTANCES] {
+		{10092548,         distance_sensor_s::ROTATION_DOWNWARD_FACING}, // bit 0
+		{10092548 + 0x100, distance_sensor_s::ROTATION_FORWARD_FACING},  // bit 1
+		{10092548 + 0x200, distance_sensor_s::ROTATION_LEFT_FACING},     // bit 2
+		{10092548 + 0x300, distance_sensor_s::ROTATION_RIGHT_FACING},    // bit 3
+		{10092548 + 0x400, distance_sensor_s::ROTATION_UPWARD_FACING},   // bit 4
+	};
 	uORB::Publication<airspeed_s>         _airspeed_pub{ORB_ID(airspeed)};
 	uORB::Publication<ranging_beacon_s>   _ranging_beacon_pub{ORB_ID(ranging_beacon)};
 	uORB::Publication<esc_status_s>       _esc_status_pub{ORB_ID(esc_status)};
+
+	// Subscribed for the disarm-edge reset_vehicle_state() trigger.
+	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 
 	// groundtruth
 	uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -190,6 +214,12 @@ private:
 	// apply the equations of motion of a rigid body and integrate one step
 	void equations_of_motion(const float dt);
 
+	// Re-spawn the vehicle at a fixed, repeatable initial condition (level, at
+	// rest, landing gear on the terrain at the SIH reference). Called at boot
+	// and on every disarm edge so each bench run starts identically instead of
+	// inheriting the previous run's integrated pose.
+	void reset_vehicle_state();
+
 	// reconstruct the noisy sensor signals
 	void reconstruct_sensors_signals(const hrt_abstime &time_now_us);
 	void send_airspeed(const hrt_abstime &time_now_us);
@@ -230,6 +260,7 @@ private:
 	matrix::Vector3f _T_B{};  // thrust force [N]
 	matrix::Vector3f _Mt_B{}; // thruster moments [Nm]
 	matrix::Vector3f _Ma_B{}; // aerodynamic moments [Nm]
+	matrix::Vector3f _Mc_B{}; // ground-contact moments [Nm]
 	matrix::Vector3f _w_B{};  // body rates in body frame [rad/s]
 	matrix::Vector3f _v_B{};  // body frame velocity [m/s]
 
@@ -294,6 +325,10 @@ private:
 		AeroSeg(0.0225f, 0.110f, 0.0f, matrix::Vector3f(0.083f - TS_CM,  0.239f, 0.0f), 0.0f, TS_AR)
 	};
 
+	// Tracks the arming state across cycles so reset_vehicle_state() can fire
+	// once on the armed->disarmed edge (re-spawn for the next bench run).
+	bool _was_armed{false};
+
 	// parameters
 	MapProjection _lpos_ref{};
 	float _lpos_ref_alt;
@@ -328,6 +363,16 @@ private:
 		(ParamFloat<px4::params::SIH_DISTSNSR_MIN>) _sih_distance_snsr_min,
 		(ParamFloat<px4::params::SIH_DISTSNSR_MAX>) _sih_distance_snsr_max,
 		(ParamFloat<px4::params::SIH_DISTSNSR_OVR>) _sih_distance_snsr_override,
+		(ParamInt<px4::params::SIH_DISTSNSR_DIR>) _sih_distance_snsr_dir,
+		(ParamInt<px4::params::SIH_TERR_EN>) _sih_terr_en,
+		(ParamFloat<px4::params::SIH_TERR_AMP>) _sih_terr_amp,
+		(ParamFloat<px4::params::SIH_TERR_FREQ>) _sih_terr_freq,
+		(ParamInt<px4::params::SIH_TERR_SEED>) _sih_terr_seed,
+		(ParamFloat<px4::params::SIH_TERR_PLANE>) _sih_terr_plane,
+		(ParamFloat<px4::params::SIH_GROUND_K>) _sih_ground_k,
+		(ParamFloat<px4::params::SIH_GROUND_C>) _sih_ground_c,
+		(ParamFloat<px4::params::SIH_GROUND_MU>) _sih_ground_mu,
+		(ParamFloat<px4::params::SIH_GEAR_Z>) _sih_gear_z,
 		(ParamFloat<px4::params::SIH_T_TAU>) _sih_thrust_tau,
 		// forward propeller
 		(ParamFloat<px4::params::SIH_F_T_MAX>) _sih_f_thrust_max,

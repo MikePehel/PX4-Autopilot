@@ -48,6 +48,8 @@ px4_add_module(
 		drivers_gyroscope
 		drivers_rangefinder
 		geo
+		terrain
+		terrain_sdf
 	)
 
 if(PX4_PLATFORM MATCHES "posix")

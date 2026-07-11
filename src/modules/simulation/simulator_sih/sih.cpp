@@ -48,6 +48,9 @@
 
 #include <drivers/drv_pwm_output.h>         // to get PWM flags
 #include <lib/drivers/device/Device.hpp>
+#include <lib/terrain/terrain.h>
+#include <lib/terrain_sdf/scene.h>
+#include <lib/terrain_sdf/terrain_sdf.h>
 
 using namespace math;
 using namespace matrix;
@@ -204,6 +207,20 @@ void Sih::sensor_step()
 		parameters_updated();
 	}
 
+	// Re-spawn the simulated vehicle on the armed->disarmed edge so the next
+	// bench run starts from an identical clean initial condition. Resetting on
+	// disarm (rather than arm) leaves the whole disarmed window for the
+	// estimator to re-converge around the snapped-back pose before takeoff.
+	vehicle_control_mode_s control_mode;
+
+	if (_vehicle_control_mode_sub.update(&control_mode)) {
+		if (_was_armed && !control_mode.flag_armed) {
+			reset_vehicle_state();
+		}
+
+		_was_armed = control_mode.flag_armed;
+	}
+
 	perf_begin(_loop_perf);
 
 	const hrt_abstime now = hrt_absolute_time();
@@ -291,18 +308,7 @@ void Sih::parameters_updated()
 		_lpos_ref.initReference(static_cast<double>(_sih_lat0.get()), static_cast<double>(_sih_lon0.get()));
 		_lpos_ref_alt = _sih_h0.get();
 
-		// Reset earth position, velocity and attitude
-		_lla.setLatitudeDeg(static_cast<double>(_sih_lat0.get()));
-		_lla.setLongitudeDeg(static_cast<double>(_sih_lon0.get()));
-		_lla.setAltitude(_lpos_ref_alt);
-		_p_E = _lla.toEcef();
-
-		const Dcmf R_E2N = _lla.computeRotEcefToNed();
-		_R_N2E = R_E2N.transpose();
-		_v_E = _R_N2E * _v_N;
-
-		_q_E = Quatf(_R_N2E) * _q;
-		_q_E.normalize();
+		reset_vehicle_state();
 	}
 
 	_MASS = _sih_mass.get();
@@ -318,12 +324,92 @@ void Sih::parameters_updated()
 	_distance_snsr_min = _sih_distance_snsr_min.get();
 	_distance_snsr_max = _sih_distance_snsr_max.get();
 	_distance_snsr_override = _sih_distance_snsr_override.get();
-	_px4_rangefinder.set_min_distance(_distance_snsr_min);
-	_px4_rangefinder.set_max_distance(_distance_snsr_max);
+
+	// Push min/max onto every enabled rangefinder instance (Option C).
+	const int32_t dir_mask = _sih_distance_snsr_dir.get();
+
+	for (uint8_t i = 0; i < NUM_DISTSNSR_INSTANCES; i++) {
+		if (dir_mask & (1 << i)) {
+			_px4_rangefinder[i].set_min_distance(_distance_snsr_min);
+			_px4_rangefinder[i].set_max_distance(_distance_snsr_max);
+		}
+	}
 
 	_T_TAU = _sih_thrust_tau.get();
 
 	_v_wind_N = Vector3f(_sih_wind_n.get(), _sih_wind_e.get(), 0.f);
+
+	// SIH_TERR_EN selects one of three mutually exclusive ground modes:
+	//   0 = off    : flat ground, no walls
+	//   1 = terrain: fBm hills via terrain(N, E); no walls
+	//   2 = walls  : flat ground + procedural wall lattice; fBm off
+	// terrain() returns fBm only when mode == 1 (amp forced to 0
+	// otherwise so the heightfield reads as flat). The wall lattice is
+	// materialised into the SDF scene only when mode == 2.
+	//
+	// SIH_TERR_PLANE is independent of SIH_TERR_EN: a non-zero slope
+	// angle engages planar mode in any ground mode. SIH's local frame is
+	// anchored at home (SIH_LOC_LAT0/LON0), so home_n/home_e are both
+	// zero in the (N, E) coordinates passed to terrain().
+	const int32_t terr_mode = _sih_terr_en.get();
+	const float terr_amp = (terr_mode == 1) ? _sih_terr_amp.get() : 0.f;
+	const float terr_wavelength = 1.f / fmaxf(_sih_terr_freq.get(), 1e-6f);
+	terrain_set_params(terr_amp, terr_wavelength, _sih_terr_seed.get(),
+			   0.f, 0.f, _sih_terr_plane.get());
+
+	// Procedural wall lattice. Walls are queried lazily per-cell by
+	// scene_eval(); only mode 2 enables them. The seed is read live, so
+	// runtime SIH_* param changes take effect immediately.
+	sdf_scene_clear();
+	sdf_walls_set_enabled(terr_mode == 2);
+}
+
+void Sih::reset_vehicle_state()
+{
+	// Re-spawn the vehicle at a fixed, repeatable initial condition. The px4
+	// process persists across arm/disarm cycles on hardware (unlike SITL, where
+	// the test harness restarts the whole process per scenario), so without an
+	// explicit reset the physics state integrates continuously and each bench
+	// run inherits the previous run's pose -- attitude and position drift
+	// run-to-run even though the board never moved, and the test is not
+	// repeatable. Called at boot (parameters_updated) and on every disarm edge.
+
+	// Zero all kinematics: at rest, level, heading North.
+	_w_B = Vector3f{};
+	_v_B = Vector3f{};
+	_v_N = Vector3f{};
+	_v_N_dot = Vector3f{};
+	_v_E = Vector3f{};
+	_v_E_dot = Vector3f{};
+	_q = Quatf{};   // identity rotation: level, yaw 0
+
+	// Spawn the vehicle so the landing gear rests AT terrain, not the CoM.
+	// Without this offset the 4-gear contact model would see SIH_GEAR_Z of
+	// penetration at boot, and the spring transient would tilt the airframe
+	// enough to trip PX4's pre-arm "Attitude failure (pitch)" check. FW/Rover
+	// keep the CoM-only hard-stop and spawn at the reference altitude exactly.
+	_lla.setLatitudeDeg(static_cast<double>(_sih_lat0.get()));
+	_lla.setLongitudeDeg(static_cast<double>(_sih_lon0.get()));
+	const bool multirotor_family = (_vehicle == VehicleType::Quadcopter
+					|| _vehicle == VehicleType::Hexacopter
+					|| _vehicle == VehicleType::TailsitterVTOL
+					|| _vehicle == VehicleType::StandardVTOL);
+	const float spawn_alt = multirotor_family
+				? (_lpos_ref_alt + _sih_gear_z.get())
+				: _lpos_ref_alt;
+	_lla.setAltitude(spawn_alt);
+	_p_E = _lla.toEcef();
+
+	const Dcmf R_E2N = _lla.computeRotEcefToNed();
+	_R_N2E = R_E2N.transpose();
+	_v_E = _R_N2E * _v_N;
+
+	_q_E = Quatf(_R_N2E) * _q;
+	_q_E.normalize();
+
+	// Keep the published local position consistent with the re-spawn.
+	_lpos_ref.project(_lla.latitude_deg(), _lla.longitude_deg(), _lpos(0), _lpos(1));
+	_lpos(2) = -(_lla.altitude() - _lpos_ref_alt);
 }
 
 void Sih::read_motors(const float dt)
@@ -607,24 +693,114 @@ void Sih::equations_of_motion(const float dt)
 	// fake ground, avoid free fall
 	const float force_down = Vector3f(_R_N2E.transpose() * sum_of_forces_E)(2);
 	Vector3f ground_force_E;
+	_Mc_B = Vector3f();
 
-	if ((_lla.altitude() - _lpos_ref_alt) < 0.f && force_down > 0.f) {
-		if (_vehicle == VehicleType::Quadcopter
-		    || _vehicle == VehicleType::Hexacopter
-		    || _vehicle == VehicleType::TailsitterVTOL
-		    || _vehicle == VehicleType::StandardVTOL) {
-			ground_force_E = -sum_of_forces_E;
+	if (_vehicle == VehicleType::Quadcopter
+	    || _vehicle == VehicleType::Hexacopter
+	    || _vehicle == VehicleType::TailsitterVTOL
+	    || _vehicle == VehicleType::StandardVTOL) {
 
-			if (!_grounded) {
-				// if we just hit the floor
-				// compute the force that will stop the vehicle in one time step
-				ground_force_E += -_v_E / dt * _MASS;
+		// 4-point landing-gear contact. Gears at the corners of the
+		// (SIH_L_PITCH, SIH_L_ROLL) rectangle, offset downward by SIH_GEAR_Z
+		// in body frame. Each gear runs the penetration / spring-damper
+		// / Coulomb-friction physics independently and self-skips when above
+		// terrain; per-gear forces sum into the body force, and per-gear
+		// (r_gear x F_gear) sums into the body-frame contact torque _Mc_B,
+		// so the vehicle tips on a slope and pivots about a single loaded gear.
+		static constexpr int NUM_GEARS = 4;
+		const float gear_z = _sih_gear_z.get();
+		const Vector3f gears_body[NUM_GEARS] = {
+			Vector3f(_L_PITCH,  _L_ROLL,  gear_z),
+			Vector3f(_L_PITCH,  -_L_ROLL, gear_z),
+			Vector3f(-_L_PITCH, -_L_ROLL, gear_z),
+			Vector3f(-_L_PITCH, _L_ROLL,  gear_z),
+		};
+
+		Vector3f F_total_N(0.f, 0.f, 0.f);
+		Vector3f M_total_B(0.f, 0.f, 0.f);
+		bool any_grounded = false;
+
+		// Per-gear spring-damper constants for the 4-point contact model.
+		//   F_normal_per_gear = max(0, K * pen - C * v_normal)
+		// then clamped to 10*M*g per gear so a boot-time penetration
+		// transient can't launch the vehicle. Defaults (K=1000, C=32)
+		// are tuned for a 1 kg multirotor with critical damping:
+		//   C_critical = 2 * sqrt(K * M / 4)   (4 gears in parallel)
+		const float k = _sih_ground_k.get();
+		const float c = _sih_ground_c.get();
+		const float mu = _sih_ground_mu.get();
+		const float g_local = gravity_acceleration_E.norm();
+		const Vector3f omega_N = _q.rotateVector(_w_B);
+
+		for (int i = 0; i < NUM_GEARS; ++i) {
+			const Vector3f r_body = gears_body[i];
+			const Vector3f r_world = _q.rotateVector(r_body);
+			const Vector3f gear_N = _lpos + r_world;
+			const float gear_terrain_h = terrain(gear_N(0), gear_N(1));
+			const float gear_alt = -gear_N(2);
+			const float penetration = gear_terrain_h - gear_alt;
+
+			if (penetration <= 0.f) {
+				continue;
 			}
 
-			_grounded = true;
+			any_grounded = true;
 
-		} else if (_vehicle == VehicleType::FixedWing
-			   || _vehicle == VehicleType::RoverAckermann) {
+			float dn = 0.f;
+			float de = 0.f;
+			terrain_gradient(gear_N(0), gear_N(1), &dn, &de);
+			Vector3f n_hat_N(-dn, -de, -1.f);
+			n_hat_N.normalize();
+
+			if (!PX4_ISFINITE(n_hat_N(0)) || !PX4_ISFINITE(n_hat_N(1)) || !PX4_ISFINITE(n_hat_N(2))) {
+				n_hat_N = Vector3f(0.f, 0.f, -1.f);
+			}
+
+			// Gear tip velocity in NED: body translation plus omega x r_world.
+			const Vector3f v_gear_N = _v_N + omega_N.cross(r_world);
+			const float v_normal = v_gear_N.dot(n_hat_N);
+
+			float F_normal_mag = math::max(0.f, k * penetration - c * v_normal);
+			const float F_normal_cap = 10.f * _MASS * g_local;
+			F_normal_mag = math::min(F_normal_mag, F_normal_cap);
+			const Vector3f F_normal_N = F_normal_mag * n_hat_N;
+
+			Vector3f F_friction_N(0.f, 0.f, 0.f);
+			const Vector3f v_tangent_N = v_gear_N - v_normal * n_hat_N;
+			const float v_tangent_norm = v_tangent_N.norm();
+
+			if (v_tangent_norm > 1e-3f && F_normal_mag > 0.f) {
+				const float F_friction_cap = mu * F_normal_mag;
+				const float F_required_to_stop = _MASS * v_tangent_norm / dt;
+
+				if (F_required_to_stop <= F_friction_cap) {
+					F_friction_N = -(_MASS / dt) * v_tangent_N;
+
+				} else {
+					F_friction_N = -F_friction_cap * v_tangent_N / v_tangent_norm;
+				}
+			}
+
+			const Vector3f F_gear_N = F_normal_N + F_friction_N;
+			F_total_N += F_gear_N;
+
+			// Torque about CoM: r_body x F_body. Convert F from NED to body.
+			const Vector3f F_gear_B = _q.rotateVectorInverse(F_gear_N);
+			M_total_B += r_body.cross(F_gear_B);
+		}
+
+		ground_force_E = _R_N2E * F_total_N;
+		_Mc_B = M_total_B;
+		_grounded = any_grounded;
+
+	} else if (_vehicle == VehicleType::FixedWing
+		   || _vehicle == VehicleType::RoverAckermann) {
+
+		// FW/Rover keep the CoM-only hard-stop. Multi-point gear for these
+		// vehicle types is out of scope for now.
+		const float terrain_h = terrain(_lpos(0), _lpos(1));
+
+		if ((_lla.altitude() - _lpos_ref_alt - terrain_h) < 0.f && force_down > 0.f) {
 			Vector3f down_u = _R_N2E.col(2);
 			ground_force_E = -down_u * sum_of_forces_E * down_u;
 
@@ -635,10 +811,10 @@ void Sih::equations_of_motion(const float dt)
 			}
 
 			_grounded = true;
-		}
 
-	} else {
-		_grounded = false;
+		} else {
+			_grounded = false;
+		}
 	}
 
 	sum_of_forces_E += ground_force_E;
@@ -663,7 +839,7 @@ void Sih::equations_of_motion(const float dt)
 	_q_E = _q_E  * dq;
 	_q_E.normalize();
 
-	const Vector3f w_B_dot = _Im1 * (_Mt_B + _Ma_B - _w_B.cross(_I * _w_B)); // conservation of angular momentum
+	const Vector3f w_B_dot = _Im1 * (_Mt_B + _Ma_B + _Mc_B - _w_B.cross(_I * _w_B)); // conservation of angular momentum
 	_w_B = constrain(_w_B + w_B_dot * dt, -6.0f * M_PI_F, 6.0f * M_PI_F);
 
 	ecefToNed();
@@ -736,21 +912,116 @@ void Sih::send_airspeed(const hrt_abstime &time_now_us)
 
 void Sih::send_dist_snsr(const hrt_abstime &time_now_us)
 {
-	float current_distance;
+	// One PX4Rangefinder instance is published per bit set in
+	// SIH_DISTSNSR_DIR (Option C). Bit 0 (downward) is the default;
+	// forward/left/right/up are opt-in. SIH_DISTSNSR_MIN/MAX/OVR apply to
+	// every enabled instance.
+	//
+	// Each instance casts a beam against the simulated world. The downward
+	// instance uses `lib/terrain`'s analytical fast-path (closed-form
+	// intersection with the ground, near-vertical only). The
+	// forward / left / right / up instances route through
+	// `lib/terrain_sdf`'s sphere tracer, which handles arbitrary beam
+	// directions against the ground plus the SDF scene of walls populated
+	// in parameters_updated(). At SIH_TERR_EN=0 the SDF scene is empty (no
+	// walls) and the ground is flat, so the analytical downward formula
+	// reduces to `altitude / cos(tilt)` and the default config (DIR=1,
+	// EN=0) reproduces the legacy single-instance downward reading.
+	struct OrientationEntry {
+		uint8_t orientation;    // distance_sensor_s::ROTATION_*
+		float   dir_body[3];    // unit beam direction in body FRD; Vector3f ctor is not constexpr
+	};
+	static constexpr OrientationEntry table[NUM_DISTSNSR_INSTANCES] = {
+		{ distance_sensor_s::ROTATION_DOWNWARD_FACING, { 0.f,  0.f,  1.f} }, // bit 0
+		{ distance_sensor_s::ROTATION_FORWARD_FACING,  { 1.f,  0.f,  0.f} }, // bit 1
+		{ distance_sensor_s::ROTATION_LEFT_FACING,     { 0.f, -1.f,  0.f} }, // bit 2
+		{ distance_sensor_s::ROTATION_RIGHT_FACING,    { 0.f,  1.f,  0.f} }, // bit 3
+		{ distance_sensor_s::ROTATION_UPWARD_FACING,   { 0.f,  0.f, -1.f} }, // bit 4
+	};
 
-	if (_distance_snsr_override >= 0.f) {
-		current_distance = _distance_snsr_override;
+	const int32_t dir_mask = _sih_distance_snsr_dir.get();
 
-	} else {
-		current_distance = -_lpos(2) / _q.dcm_z()(2);
+	const float origin_n = _lpos(0);
+	const float origin_e = _lpos(1);
+	const float origin_alt = -_lpos(2); // metres above home; terrain() returns height above home
 
-		if (current_distance > _distance_snsr_max) {
-			// this is based on lightware lw20 behaviour
-			current_distance = UINT16_MAX / 100.f;
+	const hrt_abstime now = hrt_absolute_time();
+
+	for (uint8_t i = 0; i < NUM_DISTSNSR_INSTANCES; i++) {
+		if (!(dir_mask & (1 << i))) {
+			continue;
 		}
-	}
 
-	_px4_rangefinder.update(hrt_absolute_time(), current_distance);
+		if (_distance_snsr_override >= 0.f) {
+			_px4_rangefinder[i].update(now, _distance_snsr_override);
+			continue;
+		}
+
+		const Vector3f dir_body(table[i].dir_body[0], table[i].dir_body[1], table[i].dir_body[2]);
+		const Vector3f dir_world = _q.rotateVector(dir_body);
+
+		// Both raycast() and sdf_sphere_trace() take an altitude-up Z
+		// direction, so flip the Z sign on the NED-frame `dir_world`
+		// produced by `_q.rotateVector`.
+		const sdf_vec3 sdf_origin = {origin_n, origin_e, origin_alt};
+		const sdf_vec3 sdf_dir    = {dir_world(0), dir_world(1), -dir_world(2)};
+		float t_hit;
+
+		if (table[i].orientation == distance_sensor_s::ROTATION_DOWNWARD_FACING) {
+			// Near-vertical fast-path: the closed-form in `lib/terrain` is
+			// cheap and exact while the beam is within ~5 deg of vertical.
+			t_hit = raycast(origin_n, origin_e, origin_alt,
+					dir_world(0), dir_world(1), -dir_world(2),
+					_distance_snsr_max);
+
+			if (t_hit >= _distance_snsr_max) {
+				// raycast() reports a miss both for a genuine miss and when
+				// the beam tilts out of the analytical envelope. Fall back to
+				// the sphere tracer, which resolves the hit at any angle.
+				t_hit = sdf_sphere_trace(sdf_origin, sdf_dir, _distance_snsr_max);
+			}
+
+		} else {
+			// Forward / left / right / up need the sphere tracer so they see
+			// static scene primitives in addition to the heightfield.
+			t_hit = sdf_sphere_trace(sdf_origin, sdf_dir, _distance_snsr_max);
+		}
+
+		if (t_hit < 0.f) {
+			// Origin-inside-geometry sentinel per the `lib/terrain_sdf`
+			// contract. The vehicle is clipping scene geometry; report the
+			// bin as saturated-near (distance 0) with quality 0.
+			_px4_rangefinder[i].update(now, 0.f, 0);
+			continue;
+		}
+
+		if (t_hit >= _distance_snsr_max) {
+			// No measurement. Use the MAVLink "max + 1" no-measurement marker
+			// plus quality 0 so EKF2 / collision_prevention gate the sample.
+			_px4_rangefinder[i].update(now, _distance_snsr_max + 0.01f, 0);
+			continue;
+		}
+
+		// Signal quality drops near max range AND at steep oblique angles.
+		// terrain_gradient() at the hit point gives (dh/dN, dh/dE); the
+		// outward (up) normal in NED is (-dn, -de, -1).normalize().
+		const float hit_n = origin_n + dir_world(0) * t_hit;
+		const float hit_e = origin_e + dir_world(1) * t_hit;
+		float dn = 0.f;
+		float de = 0.f;
+		terrain_gradient(hit_n, hit_e, &dn, &de);
+		Vector3f normal_up(-dn, -de, -1.f);
+		normal_up.normalize();
+		const float cos_oblique = math::constrain(fabsf(-dir_world.dot(normal_up)), 0.f, 1.f);
+		const float oblique_deg = math::degrees(acosf(cos_oblique));
+
+		float quality = 100.f
+				- 50.f * (t_hit / _distance_snsr_max)
+				- 100.f * (oblique_deg / 60.f);
+		quality = math::constrain(quality, 0.f, 100.f);
+
+		_px4_rangefinder[i].update(now, t_hit, static_cast<int8_t>(quality));
+	}
 }
 
 void Sih::send_ranging_beacon(const hrt_abstime &time_now_us)
