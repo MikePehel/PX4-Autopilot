@@ -60,6 +60,7 @@
 #include "terrain.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*============================================================================
@@ -95,6 +96,12 @@ static struct {
 /* Compile-time square of the flat takeoff-zone radius. Cached so the
  * hot path compares r² against fr² without a runtime `sqrtf`. */
 #define FLAT_R_SQ_M  ((FLAT_R_M) * (FLAT_R_M))
+
+/* Installed heightfield grid, or all-zero when none. The sample array is
+ * borrowed from the caller (see terrain_set_grid) — this library never
+ * allocates, copies, or frees it. A NULL `samples` means "no grid", which
+ * is the state grid_eval() short-circuits on. */
+static terrain_grid_t s_grid;
 
 /*============================================================================
  * Integer hash + hash-to-float.
@@ -301,6 +308,103 @@ static float raw_eval(float n, float e, float *out_dn, float *out_de)
 	return h;
 }
 
+/*============================================================================
+ * Heightfield grid sampling — bilinear with toroidal wrap.
+ *
+ * Wrap rather than clamp: lib/terrain_sdf's sphere tracer marches to
+ * max_t with no bounds check, so the heightfield has to be defined at
+ * every (N, E). Clamping would extrude the boundary row outward forever
+ * and the obstacle ring would read it as a wall.
+ *
+ * The bilinear patch over one cell is
+ *
+ *   h(tx, ty) = a + b*tx + c*ty + d*tx*ty
+ *
+ * with a = h00, b = h10 - h00, c = h01 - h00, d = h00 - h10 - h01 + h11.
+ * Its partials are exact and cost two multiplies each, so the gradient
+ * comes out of the same four samples the height did — the same "gradient
+ * is free" property the fBm accumulator has.
+ *
+ * Only C0 across cell boundaries: the height is continuous but the slope
+ * steps at each grid line. See the contract in terrain.h.
+ *============================================================================*/
+
+/* Positive modulo. C's % truncates toward zero, so a negative cell index
+ * would otherwise land outside the sample array. */
+static inline int wrap_idx(int i, int n)
+{
+	i %= n;
+	return (i < 0) ? (i + n) : i;
+}
+
+static float grid_eval(float n_world, float e_world, float *out_dn, float *out_de)
+{
+	if (s_grid.samples == NULL) {
+		*out_dn = 0.f;
+		*out_de = 0.f;
+		return 0.f;
+	}
+
+	const float inv_s = 1.f / s_grid.spacing_m;
+	const float fy = (n_world - s_grid.origin_n) * inv_s;
+	const float fx = (e_world - s_grid.origin_e) * inv_s;
+
+	const float y0f = floorf(fy);
+	const float x0f = floorf(fx);
+	const float ty  = fy - y0f;
+	const float tx  = fx - x0f;
+
+	const int nx = (int)s_grid.nx;
+	const int ny = (int)s_grid.ny;
+
+	const int y0 = wrap_idx((int)y0f, ny);
+	const int x0 = wrap_idx((int)x0f, nx);
+	const int y1 = (y0 + 1 == ny) ? 0 : (y0 + 1);
+	const int x1 = (x0 + 1 == nx) ? 0 : (x0 + 1);
+
+	const float h00 = (float)s_grid.samples[(y0 * nx) + x0];
+	const float h10 = (float)s_grid.samples[(y0 * nx) + x1];   /* +east  */
+	const float h01 = (float)s_grid.samples[(y1 * nx) + x0];   /* +north */
+	const float h11 = (float)s_grid.samples[(y1 * nx) + x1];
+
+	const float b = h10 - h00;
+	const float c = h01 - h00;
+	const float d = (h00 - h10 - h01) + h11;
+
+	*out_dn = (c + (d * tx)) * inv_s;
+	*out_de = (b + (d * ty)) * inv_s;
+
+	return h00 + (b * tx) + (c * ty) + (d * tx * ty);
+}
+
+/* Recompute the home offset from whatever sources are currently active.
+ * Both terrain_set_params() and terrain_set_grid() call this so that
+ * terrain(0, 0) == 0 holds after either one changes. */
+static void recompute_home_offset(void)
+{
+	float dn, de, gdn, gde;
+	s_params.home_offset =
+		raw_eval(s_params.home_n, s_params.home_e, &dn, &de)
+		+ grid_eval(s_params.home_n, s_params.home_e, &gdn, &gde);
+}
+
+void terrain_set_grid(const terrain_grid_t *grid)
+{
+	/* Reject anything that would make grid_eval() read out of bounds or
+	 * divide by zero. A failed file load that left the struct partly
+	 * populated must degrade to "no grid", never to garbage terrain. */
+	if (grid == NULL || grid->samples == NULL
+	    || grid->nx < 2u || grid->ny < 2u
+	    || !(grid->spacing_m > 0.f)) {
+		s_grid.samples = NULL;
+
+	} else {
+		s_grid = *grid;
+	}
+
+	recompute_home_offset();
+}
+
 /* Public terrain() and terrain_gradient() apply the home offset so that
  * terrain(home_n - home_n, home_e - home_e) = terrain(0, 0) = 0.
  *
@@ -338,10 +442,17 @@ float terrain(float north_m, float east_m)
 		return 0.f;
 	}
 
-	float dn, de;
-	return raw_eval(north_m + s_params.home_n,
-			east_m  + s_params.home_e,
-			&dn, &de) - s_params.home_offset;
+	/* Grid and fBm are additive. With no grid installed grid_eval() is a
+	 * short-circuit zero; with amp == 0 raw_eval() is. So "DEM only",
+	 * "fBm only", and "real landform plus procedural detail" are all the
+	 * same code path with no branch on the hot line. */
+	const float n_world = north_m + s_params.home_n;
+	const float e_world = east_m  + s_params.home_e;
+
+	float dn, de, gdn, gde;
+	return raw_eval(n_world, e_world, &dn, &de)
+	       + grid_eval(n_world, e_world, &gdn, &gde)
+	       - s_params.home_offset;
 }
 
 void terrain_gradient(float north_m, float east_m, float *dnorth, float *deast)
@@ -362,13 +473,22 @@ void terrain_gradient(float north_m, float east_m, float *dnorth, float *deast)
 		return;
 	}
 
+	const float n_world = north_m + s_params.home_n;
+	const float e_world = east_m  + s_params.home_e;
+
 	float dn_raw = 0.f;
 	float de_raw = 0.f;
-	(void)raw_eval(north_m + s_params.home_n,
-		       east_m  + s_params.home_e,
-		       &dn_raw, &de_raw);
-	*dnorth = dn_raw;
-	*deast  = de_raw;
+	(void)raw_eval(n_world, e_world, &dn_raw, &de_raw);
+
+	/* Same additive composition as terrain(): the grid's bilinear slope
+	 * and the fBm slope sum, so layering noise over a coarse DEM gives
+	 * the contact model a gradient that reflects both. */
+	float dn_grid = 0.f;
+	float de_grid = 0.f;
+	(void)grid_eval(n_world, e_world, &dn_grid, &de_grid);
+
+	*dnorth = dn_raw + dn_grid;
+	*deast  = de_raw + de_grid;
 }
 
 /*============================================================================
@@ -467,16 +587,22 @@ void terrain_set_params(float amp, float wavelength, int seed,
 	s_params.plane_tan  = tanf(plane_deg * TERRAIN_DEG_TO_RAD);
 
 	/* Home offset: recompute so terrain(0, 0) == 0 after this call.
-	 * Sample raw_eval directly (not terrain()) since terrain() would
-	 * subtract the stale offset. */
-	s_params.home_offset = 0.f;
-	float dn, de;
-	s_params.home_offset = raw_eval(s_params.home_n, s_params.home_e, &dn, &de);
+	 * Samples raw_eval/grid_eval directly (not terrain()) since terrain()
+	 * would subtract the stale offset. */
+	recompute_home_offset();
 }
 
 unsigned int terrain_seed_lookup_table_size(void)
 {
-	return 0u;
+	/* fBm is hash-based and costs no table. A grid installed via
+	 * terrain_set_grid() is borrowed, not owned, but reporting its size
+	 * is what makes this accessor useful. */
+	if (s_grid.samples == NULL) {
+		return 0u;
+	}
+
+	return (unsigned int)s_grid.nx * (unsigned int)s_grid.ny
+	       * (unsigned int)sizeof(int16_t);
 }
 
 int terrain_get_seed(void)

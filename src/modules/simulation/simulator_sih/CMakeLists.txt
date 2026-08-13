@@ -40,13 +40,14 @@ px4_add_module(
 		aero.hpp
 		sih.cpp
 		sih.hpp
+		terrain_map.cpp
+		terrain_map.hpp
 	MODULE_CONFIG
 		sih_params.yaml
 	DEPENDS
 		mathlib
 		drivers_accelerometer
 		drivers_gyroscope
-		drivers_rangefinder
 		geo
 		terrain
 		terrain_sdf

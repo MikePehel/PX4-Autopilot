@@ -83,6 +83,8 @@
 #ifndef PX4_SRC_LIB_TERRAIN_TERRAIN_H_
 #define PX4_SRC_LIB_TERRAIN_TERRAIN_H_
 
+#include <stdint.h>
+
 /**
  * Compile-time radius of the flat takeoff zone around home. The fBm
  * value and gradient are forced to 0 inside this disk by a hard cutoff
@@ -254,13 +256,100 @@ void terrain_set_params(float amp, float wavelength, int seed,
 			float home_n, float home_e,
 			float plane_deg);
 
+/*============================================================================
+ * Heightfield grid — real elevation data (DEM) as an alternative to fBm.
+ *
+ * The procedural fBm surface reproduces the statistical character of real
+ * terrain but never a specific place. For acceptance tests that need an
+ * actual site (a survey area, a mission rehearsal, a named valley), the
+ * library can instead sample a grid of real elevation samples supplied by
+ * the caller.
+ *
+ * The grid is NOT owned or copied by this library. The caller allocates
+ * it, keeps it alive for as long as it is installed, and passes a pointer.
+ * That keeps `lib/terrain` free of heap and of any file I/O, so the
+ * bit-exact shared-source contract with the companion viewer still holds:
+ * the viewer loads the same file and installs the same samples.
+ *
+ * ## Sampling
+ *
+ * Bilinear interpolation between the four surrounding samples, with
+ * TOROIDAL wrap in both axes. Wrapping (rather than clamping) preserves
+ * the infinite-extent contract that `lib/terrain_sdf` depends on — the
+ * sphere tracer marches to `max_t` with no bounds check anywhere, so the
+ * heightfield must be defined at every (N, E). Clamping would extrude the
+ * boundary row to infinity and read as a wall.
+ *
+ * A grid extracted from a real DEM patch does not wrap seamlessly (the
+ * north edge does not match the south edge), so the wrap seam is a real
+ * discontinuity. Keep the vehicle away from it, or fit a patch large
+ * enough that the seam is outside the operating area.
+ *
+ * ## Composition with fBm
+ *
+ * Grid and fBm are ADDITIVE, not exclusive:
+ *
+ *   terrain(N, E) = grid(N, E) + fbm(N, E) - home_offset
+ *
+ * With `amp == 0` the fBm term is a free zero and you get the DEM alone.
+ * With `amp > 0` the procedural noise layers fine detail on top of the
+ * real landform, which is the useful mode when the source DEM is coarser
+ * (e.g. 30 m SRTM) than the features the vehicle actually flies against.
+ *
+ * ## Gradient
+ *
+ * The bilinear surface has an analytic gradient, returned by
+ * `terrain_gradient()` alongside the fBm gradient. It is piecewise and
+ * only C0 across cell boundaries — the slope steps at each grid line.
+ * That is visible to the landing-gear contact model on coarse grids;
+ * layering a little fBm on top smooths it in practice.
+ *
+ * ## Sample encoding
+ *
+ * `int16_t` metres, matching SRTM/Copernicus native encoding, so the
+ * converter is a straight copy with no requantisation. Range ±32767 m
+ * covers every landform on Earth. One sample is 2 bytes, so a 450 x 450
+ * grid (a 1-degree alpine tile at 240 m spacing) is 405 KB.
+ */
+typedef struct {
+	const int16_t *samples;   /**< ny * nx samples, row-major, metres.
+				    *  Index (i_north, i_east) is
+				    *  `samples[i_north * nx + i_east]`.
+				    *  Row 0 is the SOUTHERNMOST row, so
+				    *  increasing index means increasing north. */
+	uint16_t       nx;        /**< samples along east  (>= 2) */
+	uint16_t       ny;        /**< samples along north (>= 2) */
+	float          spacing_m; /**< ground distance between samples [m] */
+	float          origin_n;  /**< north coord of sample (0, 0) [m from home] */
+	float          origin_e;  /**< east  coord of sample (0, 0) [m from home] */
+} terrain_grid_t;
+
+/**
+ * Install (or remove) a heightfield grid.
+ *
+ * Pass `NULL` to remove the grid and revert to pure fBm. The library
+ * stores the pointer, not a copy — the caller must keep the sample data
+ * alive until it installs a different grid or `NULL`.
+ *
+ * Rejects (and treats as `NULL`) any grid with `samples == NULL`,
+ * `nx < 2`, `ny < 2`, or `spacing_m <= 0`, so a partially-populated
+ * struct from a failed file load cannot produce garbage terrain.
+ *
+ * Recomputes the home offset so `terrain(0, 0) == 0` still holds after
+ * the call, exactly as `terrain_set_params()` does.
+ *
+ * @param grid  Grid descriptor to install, or NULL to clear.
+ */
+void terrain_set_grid(const terrain_grid_t *grid);
+
 /**
  * Return the size in bytes of any lookup table the terrain library holds.
  *
- * The current implementation is hash-based and uses zero lookup-table
- * memory; this accessor returns 0. Provided as a discoverable answer to
- * "how much RAM does terrain.c cost?" without anyone having to read the
- * source.
+ * The hash-based fBm path uses zero lookup-table memory. When a
+ * heightfield grid is installed via `terrain_set_grid()` this returns
+ * the grid's sample-array size (`nx * ny * sizeof(int16_t)`), which is
+ * the discoverable answer to "how much RAM is the terrain costing me?"
+ * Note the library does not own that memory, it only reports it.
  */
 unsigned int terrain_seed_lookup_table_size(void);
 

@@ -245,5 +245,195 @@ TEST(TestTerrain, ThousandCallsUnderTenMs)
 
 TEST(TestTerrain, LookupTableSizeIsZero)
 {
+	terrain_set_grid(nullptr);
+	EXPECT_EQ(terrain_seed_lookup_table_size(), 0u);
+}
+
+/*============================================================================
+ * Heightfield grid (terrain_set_grid) — real-elevation DEM path.
+ *
+ * The fixture is a 4x4 grid at 100 m spacing holding the plane
+ * h = 3*i_north + 1*i_east, so every interpolated value and both slope
+ * components are hand-computable and independent of the fBm hash.
+ *
+ * Probes stay outside the FLAT_R_M disk around home except where the flat
+ * zone is itself under test.
+ *============================================================================*/
+
+namespace
+{
+
+constexpr float GRID_SPACING = 100.f;
+
+int16_t g_grid_samples[16];
+
+terrain_grid_t make_test_grid()
+{
+	for (int iy = 0; iy < 4; iy++) {
+		for (int ix = 0; ix < 4; ix++) {
+			g_grid_samples[(iy * 4) + ix] = static_cast<int16_t>((3 * iy) + ix);
+		}
+	}
+
+	terrain_grid_t g{};
+	g.samples = g_grid_samples;
+	g.nx = 4;
+	g.ny = 4;
+	g.spacing_m = GRID_SPACING;
+	g.origin_n = 0.f;
+	g.origin_e = 0.f;
+	return g;
+}
+
+/* Install the grid with fBm switched off, so terrain() is the grid alone. */
+void install_grid_only()
+{
+	const terrain_grid_t g = make_test_grid();
+	terrain_set_params(0.f, 200.f, 0, 0.f, 0.f, 0.f);
+	terrain_set_grid(&g);
+}
+
+} // namespace
+
+TEST(TestTerrainGrid, SamplesExactLatticeValues)
+{
+	install_grid_only();
+
+	EXPECT_NEAR(terrain(GRID_SPACING, 0.f), 3.f, 1e-4f);
+	EXPECT_NEAR(terrain(0.f, 2 * GRID_SPACING), 2.f, 1e-4f);
+	EXPECT_NEAR(terrain(GRID_SPACING, GRID_SPACING), 4.f, 1e-4f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, InterpolatesBilinearlyBetweenSamples)
+{
+	install_grid_only();
+
+	EXPECT_NEAR(terrain(0.5f * GRID_SPACING, 0.f), 1.5f, 1e-4f);
+	EXPECT_NEAR(terrain(0.f, 0.5f * GRID_SPACING), 0.5f, 1e-4f);
+	EXPECT_NEAR(terrain(0.5f * GRID_SPACING, 0.5f * GRID_SPACING), 2.f, 1e-4f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, WrapsToroidally)
+{
+	install_grid_only();
+
+	// Period is nx * spacing = 400 m on both axes. lib/terrain_sdf's tracer
+	// marches with no bounds check, so the field has to be defined and
+	// continuous everywhere — wrap, never clamp.
+	const float period = 4 * GRID_SPACING;
+
+	EXPECT_NEAR(terrain(period + GRID_SPACING, 0.f), terrain(GRID_SPACING, 0.f), 1e-4f);
+	EXPECT_NEAR(terrain(0.f, -period + (2 * GRID_SPACING)), terrain(0.f, 2 * GRID_SPACING), 1e-4f);
+
+	// Negative cell indices must wrap, not read off the front of the array.
+	EXPECT_NEAR(terrain(-GRID_SPACING, 0.f), terrain(3 * GRID_SPACING, 0.f), 1e-4f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, GradientMatchesThePlaneSlope)
+{
+	install_grid_only();
+
+	float dn = 0.f;
+	float de = 0.f;
+	terrain_gradient(0.5f * GRID_SPACING, 0.5f * GRID_SPACING, &dn, &de);
+
+	EXPECT_NEAR(dn, 3.f / GRID_SPACING, 1e-5f);
+	EXPECT_NEAR(de, 1.f / GRID_SPACING, 1e-5f);
+
+	// And it agrees with a central difference at an off-lattice point.
+	const float n = 137.f;
+	const float e = 61.f;
+	const float h = 0.5f;
+	terrain_gradient(n, e, &dn, &de);
+	EXPECT_NEAR((terrain(n + h, e) - terrain(n - h, e)) / (2 * h), dn, 1e-3f);
+	EXPECT_NEAR((terrain(n, e + h) - terrain(n, e - h)) / (2 * h), de, 1e-3f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, HomeOriginIsExactlyZeroWithOffsetGrid)
+{
+	terrain_grid_t g = make_test_grid();
+
+	// Shift the grid so home lands on a non-zero sample. terrain(0,0) must
+	// still read exactly zero, i.e. the home offset accounts for the grid.
+	g.origin_n = -GRID_SPACING;
+	g.origin_e = -GRID_SPACING;
+	terrain_set_params(0.f, 200.f, 0, 0.f, 0.f, 0.f);
+	terrain_set_grid(&g);
+
+	EXPECT_NEAR(terrain(0.f, 0.f), 0.f, 1e-6f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, ComposesAdditivelyWithFbm)
+{
+	const terrain_grid_t g = make_test_grid();
+	const float n = 600.f;
+	const float e = 600.f;
+
+	terrain_set_params(50.f, 300.f, 7, 0.f, 0.f, 0.f);
+	terrain_set_grid(&g);
+	const float both = terrain(n, e);
+
+	terrain_set_grid(nullptr);
+	const float fbm_only = terrain(n, e);
+
+	terrain_set_params(0.f, 300.f, 7, 0.f, 0.f, 0.f);
+	terrain_set_grid(&g);
+	const float grid_only = terrain(n, e);
+
+	// Grid and fBm are additive, which is what lets a coarse DEM carry
+	// procedural fine detail on top of the real landform.
+	EXPECT_NEAR(both, fbm_only + grid_only, 1e-3f);
+
+	terrain_set_grid(nullptr);
+}
+
+TEST(TestTerrainGrid, RejectsMalformedGridsInsteadOfReadingOutOfBounds)
+{
+	const terrain_grid_t good = make_test_grid();
+	terrain_set_params(0.f, 200.f, 0, 0.f, 0.f, 0.f);
+
+	// A partially populated struct from a failed file load must degrade to
+	// "no grid", never to garbage terrain.
+	terrain_grid_t bad = good;
+	bad.nx = 1;
+	terrain_set_grid(&bad);
+	EXPECT_NEAR(terrain(137.f, 61.f), 0.f, 1e-6f);
+
+	bad = good;
+	bad.ny = 0;
+	terrain_set_grid(&bad);
+	EXPECT_NEAR(terrain(137.f, 61.f), 0.f, 1e-6f);
+
+	bad = good;
+	bad.spacing_m = 0.f;
+	terrain_set_grid(&bad);
+	EXPECT_NEAR(terrain(137.f, 61.f), 0.f, 1e-6f);
+
+	bad = good;
+	bad.samples = nullptr;
+	terrain_set_grid(&bad);
+	EXPECT_NEAR(terrain(137.f, 61.f), 0.f, 1e-6f);
+
+	terrain_set_grid(nullptr);
+	EXPECT_NEAR(terrain(137.f, 61.f), 0.f, 1e-6f);
+}
+
+TEST(TestTerrainGrid, ReportsItsSampleMemory)
+{
+	const terrain_grid_t g = make_test_grid();
+	terrain_set_grid(&g);
+	EXPECT_EQ(terrain_seed_lookup_table_size(), 4u * 4u * sizeof(int16_t));
+
+	terrain_set_grid(nullptr);
 	EXPECT_EQ(terrain_seed_lookup_table_size(), 0u);
 }

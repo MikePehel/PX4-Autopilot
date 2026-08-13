@@ -65,7 +65,6 @@
 #include <drivers/drv_hrt.h>        // to get the real time
 #include <lib/drivers/accelerometer/PX4Accelerometer.hpp>
 #include <lib/drivers/gyroscope/PX4Gyroscope.hpp>
-#include <lib/drivers/rangefinder/PX4Rangefinder.hpp>
 #include <lib/geo/geo.h>
 #include <lib/lat_lon_alt/lat_lon_alt.hpp>
 #include <lib/terrain/terrain.h>
@@ -76,19 +75,20 @@
 #include <uORB/PublicationMulti.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionInterval.hpp>
+#include <uORB/topics/parameter_update.h>
 #include <uORB/topics/airspeed.h>
 #include <uORB/topics/actuator_outputs.h>
 #include <uORB/topics/distance_sensor.h>
-#include <uORB/topics/esc_status.h>
-#include <uORB/topics/obstacle_distance.h>
-#include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
-#include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_global_position.h>
-#include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/obstacle_distance.h>
 #include <uORB/topics/ranging_beacon.h>
+#include <uORB/topics/vehicle_control_mode.h>
+#include <uORB/topics/vehicle_land_detected.h>
+
+#include "terrain_map.hpp"
 
 #if defined(ENABLE_LOCKSTEP_SCHEDULER)
 #include <sys/time.h>
@@ -136,42 +136,34 @@ private:
 	// simulated sensors
 	PX4Accelerometer _px4_accel{1310988}; // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
 	PX4Gyroscope     _px4_gyro{1310988};  // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
-	// One PX4Rangefinder per enabled SIH_DISTSNSR_DIR bit (down/fwd/left/
-	// right/up). Publishing through the driver wrapper (rather than raw
-	// distance_sensor) matches the rest of SIH's sensors and lets each
-	// beam inherit the wrapper's device-id / rotation handling. The
-	// downward beam (bit 0) keeps the legacy sim device id (10092548:
-	// DRV_DIST_DEVTYPE_SIM, BUS 0, ADDR 0); the others offset the address
-	// field so each advertises its own distance_sensor instance. Consumers
-	// (EKF2 terrain, CollisionPrevention) filter by orientation, so the
-	// beams are independent — the side beams are opt-in via SIH_DISTSNSR_DIR.
+
+	// One distance_sensor uORB instance per enabled SIH_DISTSNSR_DIR bit
+	// (downward / forward / left / right / up). Instances are advertised
+	// on the first publish() of each slot; consumers (EKF2, collision
+	// prevention) filter by message.orientation so allocation order is
+	// not load-bearing.
 	static constexpr uint8_t NUM_DISTSNSR_INSTANCES = 5;
-	PX4Rangefinder _px4_rangefinder[NUM_DISTSNSR_INSTANCES] {
-		{10092548,         distance_sensor_s::ROTATION_DOWNWARD_FACING}, // bit 0
-		{10092548 + 0x100, distance_sensor_s::ROTATION_FORWARD_FACING},  // bit 1
-		{10092548 + 0x200, distance_sensor_s::ROTATION_LEFT_FACING},     // bit 2
-		{10092548 + 0x300, distance_sensor_s::ROTATION_RIGHT_FACING},    // bit 3
-		{10092548 + 0x400, distance_sensor_s::ROTATION_UPWARD_FACING},   // bit 4
+	uORB::PublicationMulti<distance_sensor_s> _distance_snsr_pubs[NUM_DISTSNSR_INSTANCES] {
+		uORB::PublicationMulti<distance_sensor_s>{ORB_ID(distance_sensor)},
+		uORB::PublicationMulti<distance_sensor_s>{ORB_ID(distance_sensor)},
+		uORB::PublicationMulti<distance_sensor_s>{ORB_ID(distance_sensor)},
+		uORB::PublicationMulti<distance_sensor_s>{ORB_ID(distance_sensor)},
+		uORB::PublicationMulti<distance_sensor_s>{ORB_ID(distance_sensor)},
 	};
 	uORB::Publication<airspeed_s>         _airspeed_pub{ORB_ID(airspeed)};
 	uORB::Publication<ranging_beacon_s>   _ranging_beacon_pub{ORB_ID(ranging_beacon)};
-	uORB::Publication<esc_status_s>       _esc_status_pub{ORB_ID(esc_status)};
 
-	// Obstacle ring: one simulated scanning lidar. Persistent 72-bin cache
-	// so each 10 Hz publish carries the freshest full-ring snapshot even
-	// though only OBST_BINS_PER_CYCLE bins are recomputed per cycle
-	// (spinning-lidar simulation). Consumed by CollisionPrevention.
+	// Obstacle ring: persistent 72-bin cache so each 10 Hz publish carries
+	// the freshest snapshot of the full ring even though only 36 bins are
+	// recomputed per cycle (spinning-lidar simulation).
 	uORB::Publication<obstacle_distance_s> _obstacle_distance_pub{ORB_ID(obstacle_distance)};
 	uint16_t _obst_bin_cache[72] {};
 	uint8_t  _obst_sweep_offset{0};
-	// 36 bins/cycle at 10 Hz sweeps the full 72-bin ring every 0.2 s (a
-	// ~5 Hz spinning lidar). Each bin is one sdf_sphere_trace; the
-	// worst-case cycle cost stays inside the M7 real-time budget.
+	// 36 bins/cycle at the 10 Hz publish rate sweeps the full 72-bin ring
+	// every 0.2 s, i.e. a ~5 Hz spinning lidar. Worst-case obstacle-cycle
+	// cost stays well inside the per-cycle real-time budget (each bin is one
+	// sdf_sphere_trace; see _send_obstacle_distance_perf).
 	static constexpr uint8_t OBST_BINS_PER_CYCLE = 36;
-
-	// Gates the obstacle ring: only meaningful for CollisionPrevention.
-	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
-	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 
 	// groundtruth
 	uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -181,6 +173,11 @@ private:
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 	uORB::Subscription _actuator_out_sub{ORB_ID(actuator_outputs_sim)};
+
+	// Gates the obstacle ring: it is only consumed by CollisionPrevention
+	// (manual position control / POSCTL) and only while flying.
+	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
+	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 
 	// hard constants
 	static constexpr uint16_t NUM_ACTUATORS_MAX = 9;
@@ -220,8 +217,6 @@ private:
 
 	// read the motor signals outputted from the mixer
 	void read_motors(const float dt);
-	void publish_esc_status();
-	uint8_t num_motors() const;
 
 	// generate the motors thrust and torque in the body frame
 	void generate_force_and_torques(const float dt);
@@ -246,8 +241,17 @@ private:
 	void generate_ts_aerodynamics();
 	void generate_rover_ackermann_dynamics(const float throttle_cmd, const float steering_cmd, const float dt);
 	void sensor_step();
+	static float computeGravity(double lat);
 
 	void ecefToNed();
+
+	struct Wgs84 {
+		static constexpr double equatorial_radius = 6378137.0;
+		static constexpr double eccentricity = 0.0818191908425;
+		static constexpr double eccentricity2 = eccentricity * eccentricity;
+		static constexpr double gravity_equator = 9.7803253359;
+	};
+
 
 #if defined(ENABLE_LOCKSTEP_SCHEDULER)
 	void lockstep_loop();
@@ -351,6 +355,10 @@ private:
 	// once on the armed->disarmed edge (re-spawn for the next bench run).
 	bool _was_armed{false};
 
+	// Real-elevation heightmap loaded from the SD card (SIH_TERR_EN = 3).
+	// Owns the sample buffer that lib/terrain borrows; see terrain_map.hpp.
+	TerrainMap _terrain_map{};
+
 	// parameters
 	MapProjection _lpos_ref{};
 	float _lpos_ref_alt;
@@ -359,8 +367,6 @@ private:
 	matrix::Matrix3f _Im1;  // inverse of the inertia matrix
 
 	float _distance_snsr_min, _distance_snsr_max, _distance_snsr_override;
-
-	esc_status_s _esc_status{};
 
 	// parameters defined in sih_params.c
 	DEFINE_PARAMETERS(

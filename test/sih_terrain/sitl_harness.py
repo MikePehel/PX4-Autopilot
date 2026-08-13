@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import math
 import time
 from pathlib import Path
 
@@ -129,14 +130,19 @@ def set_param(conn, name: str, value, kind: str = "real32") -> bool:
     while time.monotonic() - t0 < 2.0:
         msg = conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
         if msg and msg.param_id.strip("\x00") == name:
-            return True
-    return False
+            return msg
+    return None
 
 
 # ---------- flight prep ------------------------------------------------------
 
-def wait_for_ekf2_ready(conn, timeout_s: float = 30.0) -> bool:
+def wait_for_ekf2_ready(conn, timeout_s: float = 30.0):
     """Block until EKF2 publishes a valid global origin (HOME_POSITION).
+
+    Returns the HOME_POSITION message, or None on timeout. Callers that only
+    care whether it worked can keep testing it as a boolean; callers that need
+    to place a map against home need the lat/lon, and re-requesting it after
+    the fact races with the vehicle arming.
 
     Without this, mode switches to AUTO.MISSION silently fail because PX4
     refuses to accept a global mission when the estimator hasn't anchored
@@ -156,7 +162,54 @@ def wait_for_ekf2_ready(conn, timeout_s: float = 30.0) -> bool:
             print(f"  EKF2 ready: home lat={msg.latitude/1e7:.6f} "
                   f"lon={msg.longitude/1e7:.6f} alt={msg.altitude/1000:.1f}m",
                   flush=True)
-            return True
+
+            if not _origin_matches_sih(conn, msg):
+                return None
+
+            return msg
+    return None
+
+
+def _origin_matches_sih(conn, home, tol_m: float = 50.0) -> bool:
+    """Refuse to fly when EKF2's origin and SIH's home have drifted apart.
+
+    SIH reads SIH_LOC_* live, but EKF2 anchors its local origin once at
+    startup and does not re-origin on a parameter change. Change home without
+    a successful reboot and the two disagree silently: the simulation runs at
+    the new home while local position is reported against the old one. Nothing
+    errors, position looks plausible, and every assertion downstream fails in a
+    way that looks like a code fault rather than a stale origin.
+
+    Cheap to check, and it has cost entire afternoons when it was not.
+    """
+    want = {}
+    for name in ("SIH_LOC_LAT0", "SIH_LOC_LON0", "SIH_LOC_H0"):
+        conn.mav.param_request_read_send(
+            conn.target_system, conn.target_component, name.encode(), -1)
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5.0 and len(want) < 3:
+        pv = conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=1.0)
+        if pv and pv.param_id in ("SIH_LOC_LAT0", "SIH_LOC_LON0", "SIH_LOC_H0"):
+            want[pv.param_id] = pv.param_value
+
+    if len(want) < 3:
+        print("  WARNING: could not read SIH_LOC_*; origin not verified", flush=True)
+        return True
+
+    lat, lon, alt = home.latitude / 1e7, home.longitude / 1e7, home.altitude / 1000.0
+    d_north = (lat - want["SIH_LOC_LAT0"]) * 110574.0
+    d_east = ((lon - want["SIH_LOC_LON0"]) * 111320.0
+              * math.cos(math.radians(lat)))
+    d_up = alt - want["SIH_LOC_H0"]
+
+    if max(abs(d_north), abs(d_east), abs(d_up)) <= tol_m:
+        return True
+
+    print(f"  EKF2 origin does not match SIH_LOC_*: "
+          f"N{d_north:+.0f} E{d_east:+.0f} U{d_up:+.0f} m", flush=True)
+    print("  The board did not reboot after SIH_LOC_* changed. Reboot and "
+          "confirm the USB device re-enumerates before flying.", flush=True)
     return False
 
 
@@ -182,8 +235,8 @@ def arm(conn, force: bool = False) -> bool:
             last_send = time.monotonic()
         msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
         if msg and (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
-            return True
-    return False
+            return msg
+    return None
 
 
 def relax_safety_for_sitl(conn):

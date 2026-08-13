@@ -447,8 +447,23 @@ def run(args, out_dir: Path):
             set_param(conn, "COM_ARM_ODID", 0, "int32")
             set_param(conn, "COM_ARM_HFLT_CHK", 0, "int32")
         set_param(conn, "SIH_OBST_EN", 1, "int32")
-        set_param(conn, "SIH_OBST_MAX", SIH_OBST_MAX_M, "real32")
-        set_param(conn, "SIH_TERR_EN", 2, "int32")  # walls mode
+        set_param(conn, "SIH_OBST_MAX", args.obst_max, "real32")
+
+        # Which world CP is asked to avoid. The obstacle ring raycasts
+        # scene_eval() in every case, and scene_eval() is
+        # min(heightfield, walls-if-enabled), so the ring sees whichever
+        # heightfield SIH_TERR_EN selects. Avoiding a lattice wall, an fBm
+        # hillside and a canyon rim are therefore the same code path fed
+        # three different surfaces, which is exactly why all three are worth
+        # flying.
+        WORLDS = {"walls": 2, "terrain": 1, "map": 3}
+        set_param(conn, "SIH_TERR_EN", WORLDS[args.world], "int32")
+
+        if args.world == "terrain":
+            # fBm is flat until amp is non-zero, and a flat world gives CP
+            # nothing to brake for. This is the single most common way the
+            # terrain CP test silently passes while testing nothing.
+            set_param(conn, "SIH_TERR_AMP", args.terr_amp, "real32")
         # The wall at N=30 (lattice cell (3, 0) under SEED=3) is the
         # pinned fixture this test expects CP to engage on.
         set_param(conn, "SIH_TERR_SEED", args.terr_seed, "int32")
@@ -556,6 +571,15 @@ def main(argv) -> int:
                     help="run against a connected flight controller instead of "
                          "booting SITL, e.g. /dev/cu.usbmodem01")
     ap.add_argument("--terr-seed", type=int, default=DEFAULT_TERR_SEED)
+    ap.add_argument("--world", choices=("walls", "terrain", "map"), default="walls",
+                    help="what CP has to avoid: the wall lattice (SIH_TERR_EN=2), "
+                         "fBm hills (=1), or a .pxtm elevation map (=3)")
+    ap.add_argument("--obst-max", type=float, default=SIH_OBST_MAX_M,
+                    help="SIH_OBST_MAX ring reach [m]; real DEM slopes are far "
+                         "gentler than a lattice wall, so a 50 m ring may never "
+                         "see terrain rise above cruise altitude")
+    ap.add_argument("--terr-amp", type=float, default=30.0,
+                    help="SIH_TERR_AMP for --world terrain; 0 is a flat world")
     ap.add_argument("--yaw-deg", type=float, default=None,
                     help="yaw to this compass heading before flying forward "
                          "(reproduce a hardware heading in SITL)")

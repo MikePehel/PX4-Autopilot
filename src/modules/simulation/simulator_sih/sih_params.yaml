@@ -268,9 +268,9 @@ parameters:
       max: 31
     SIH_TERR_EN:
       description:
-        short: Terrain mode selector (off / fBm terrain / walls)
+        short: Terrain mode selector (off / fBm terrain / walls / DEM map)
         long: |-
-          Selects one of three mutually exclusive ground modes. Both the
+          Selects one of four mutually exclusive ground modes. Both the
           fBm terrain (mode 1) and the wall lattice (mode 2) share the
           hash primitive in lib/terrain via SIH_TERR_SEED, but only one
           materialises at a time.
@@ -285,6 +285,13 @@ parameters:
                 independently hashed and each occupied cell produces a
                 vertical wall whose dimensions and yaw come from the
                 cell's hash. SIH_TERR_AMP is ignored in this mode.
+            3 = map. Real elevation sampled from a heightmap file at
+                /fs/microsd/etc/terrain.pxtm, bilinearly interpolated
+                with toroidal wrap outside the patch. Build the file
+                from an SRTM tile with Tools/simulation/sih/
+                dem_to_pxtm.py. If the file is missing or malformed the
+                ground stays flat and the reason is logged at boot.
+                SIH_TERR_AMP is ignored in this mode.
 
           The active mode is visible to the obstacle ring (SIH_OBST_EN)
           and to the forward/side/up distance sensors (SIH_DISTSNSR_DIR)
@@ -296,11 +303,12 @@ parameters:
       type: int32
       default: 0
       min: 0
-      max: 2
+      max: 3
       values:
         0: Off (flat ground)
         1: Terrain (fBm hills)
         2: Walls (flat ground + wall lattice)
+        3: Map (real elevation from SD card)
     SIH_TERR_AMP:
       description:
         short: Terrain peak-to-peak amplitude
