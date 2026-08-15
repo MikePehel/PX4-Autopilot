@@ -374,7 +374,7 @@ void Sih::parameters_updated()
 			// The header's origin is only readable after the load, so
 			// anchor in a second step rather than re-reading the file.
 			const matrix::Vector2f corner = _lpos_ref.project(
-					_terrain_map.origin_lat(), _terrain_map.origin_lon());
+								_terrain_map.origin_lat(), _terrain_map.origin_lon());
 			_terrain_map.set_origin(corner(0), corner(1));
 		}
 
