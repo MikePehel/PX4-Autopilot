@@ -99,7 +99,9 @@ bool first_wall(sdf_prim_t *out, int32_t *ci = nullptr, int32_t *cj = nullptr)
 		for (int32_t j = -WALL_CELL_RADIUS_CELLS; j <= WALL_CELL_RADIUS_CELLS; ++j) {
 			if (scene_wall_at_cell(i, j, out)) {
 				if (ci) { *ci = i; }
+
 				if (cj) { *cj = j; }
+
 				return true;
 			}
 		}

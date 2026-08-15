@@ -82,7 +82,7 @@ TEST(TestTerrain, HomeOriginIsExactlyZero)
 	for (int seed : {0, 1, 7, 42, 1000}) {
 		configure_hilly(seed);
 		EXPECT_NEAR(terrain(0.f, 0.f), 0.f, 1e-3f)
-			<< "seed=" << seed;
+				<< "seed=" << seed;
 	}
 }
 
