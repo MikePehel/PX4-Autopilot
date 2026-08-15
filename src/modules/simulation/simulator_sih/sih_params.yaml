@@ -268,9 +268,9 @@ parameters:
       max: 31
     SIH_TERR_EN:
       description:
-        short: Terrain mode selector (off / fBm terrain / walls / DEM map)
+        short: Terrain mode selector (off / fBm terrain / walls / DEM map / corridor)
         long: |-
-          Selects one of four mutually exclusive ground modes. Both the
+          Selects one of five mutually exclusive ground modes. Both the
           fBm terrain (mode 1) and the wall lattice (mode 2) share the
           hash primitive in lib/terrain via SIH_TERR_SEED, but only one
           materialises at a time.
@@ -292,6 +292,17 @@ parameters:
                 dem_to_pxtm.py. If the file is missing or malformed the
                 ground stays flat and the reason is logged at boot.
                 SIH_TERR_AMP is ignored in this mode.
+            4 = corridor. Solid wall boxes arranged so the clear space
+                between them reads as rooms and corridors. Walls are
+                ordinary SDF primitives, so they compose with the ground
+                by min()-union rather than replacing it, and the vehicle
+                can fly out through a doorway and land on open ground.
+                Rays intersect them exactly instead of sphere-marching,
+                so a corridor costs the same per ray as open air. The
+                layout is the hand-built corridor in corridor_demo.cpp:
+                90 m by 24 m clear, walls 8 m tall, split into three bays
+                by cross walls carrying centred 8 m doorways.
+                SIH_TERR_AMP and the wall lattice are both ignored.
 
           The active mode is visible to the obstacle ring (SIH_OBST_EN)
           and to the forward/side/up distance sensors (SIH_DISTSNSR_DIR)
@@ -303,12 +314,13 @@ parameters:
       type: int32
       default: 0
       min: 0
-      max: 3
+      max: 4
       values:
         0: Off (flat ground)
         1: Terrain (fBm hills)
         2: Walls (flat ground + wall lattice)
         3: Map (real elevation from SD card)
+        4: Corridor (hand-built walls forming rooms)
     SIH_TERR_AMP:
       description:
         short: Terrain peak-to-peak amplitude

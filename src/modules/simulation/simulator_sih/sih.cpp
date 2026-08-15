@@ -41,6 +41,7 @@
  */
 
 #include "aero.hpp"
+#include "corridor_demo.hpp"
 #include "sih.hpp"
 
 #include <px4_platform_common/getopt.h>
@@ -391,6 +392,21 @@ void Sih::parameters_updated()
 	// read live, so runtime SIH_* param changes take effect immediately.
 	sdf_scene_clear();
 	sdf_walls_set_enabled(terr_mode == 2);
+
+	// Corridor walls. These are solid boxes in the same scene list the
+	// generic primitives use, so they compose with terrain by min()-union
+	// rather than replacing it: the vehicle can fly out of a doorway and
+	// land on open ground. sdf_scene_clear() above already emptied the
+	// list, so this is an unconditional (re)install.
+	//
+	// A building that fails its own self-check is worse than no building:
+	// every ring bin and every rangefinder would report a plausible wrong
+	// distance with no other symptom. So a failed check leaves the scene
+	// empty and the ground flat, which is visibly wrong rather than
+	// quietly wrong.
+	if (terr_mode == 4 && !corridor_demo_install_and_check()) {
+		PX4_ERR("corridor: self-check failed, falling back to flat ground");
+	}
 }
 
 void Sih::reset_vehicle_state()

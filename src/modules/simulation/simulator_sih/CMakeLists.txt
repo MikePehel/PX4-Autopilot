@@ -38,6 +38,8 @@ px4_add_module(
 		${MAX_CUSTOM_OPT_LEVEL}
 	SRCS
 		aero.hpp
+		corridor_demo.cpp
+		corridor_demo.hpp
 		sih.cpp
 		sih.hpp
 		terrain_map.cpp
