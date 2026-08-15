@@ -33,3 +33,4 @@
 
 px4_add_unit_gtest(SRC test_terrain_sdf.cpp LINKLIBS terrain_sdf terrain)
 px4_add_unit_gtest(SRC test_scene.cpp LINKLIBS terrain_sdf terrain)
+px4_add_unit_gtest(SRC test_corridor.cpp LINKLIBS terrain_sdf terrain)

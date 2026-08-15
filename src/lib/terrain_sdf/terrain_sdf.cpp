@@ -353,7 +353,12 @@ static float scene_walls_sdf(sdf_vec3 p)
 	return d;
 }
 
-static float scene_eval(sdf_vec3 p)
+/*
+ * The continuous part of the scene: the heightfield plus the procedural
+ * wall lattice. Both are fields rather than objects, so a ray can only
+ * find them by marching.
+ */
+static float scene_field_sdf(sdf_vec3 p)
 {
 	float h = terrain(p.n, p.e);
 	float d = p.alt - h;
@@ -364,6 +369,13 @@ static float scene_eval(sdf_vec3 p)
 		d = dwalls;
 	}
 
+	return d;
+}
+
+static float scene_eval(sdf_vec3 p)
+{
+	float d = scene_field_sdf(p);
+
 	for (int i = 0; i < s_scene_count; ++i) {
 		float di = prim_sdf(p, &s_scene[i]);
 
@@ -373,6 +385,98 @@ static float scene_eval(sdf_vec3 p)
 	}
 
 	return d;
+}
+
+/*============================================================================
+ * scene_prims_ray - exact ray/primitive intersection over the scene list.
+ *
+ * Marching finds a surface by stepping the distance to the NEAREST surface
+ * in any direction. Indoors that collapses: a ray down a 24 m corridor steps
+ * 12 m at a time no matter how far the clear air ahead runs, because a side
+ * wall is what bounds the step. Run out of SDF_MAX_ITER and the tracer
+ * returns max_t, which is the same value SIH publishes to mean "nothing in
+ * range" - an exhausted ray and a clear ray become indistinguishable.
+ *
+ * Boxes do not need marching. A ray/box intersection is closed form, so the
+ * answer is exact and costs the same whatever the geometry looks like. This
+ * applies to any materialised primitive rather than to one scene mode.
+ *
+ * Slab method in the box's local frame, using the same inverse yaw rotation
+ * prim_sdf_box() applies to a point. Returns the nearest forward hit within
+ * max_t, or max_t when nothing is hit.
+ *============================================================================*/
+static float box_ray_hit(sdf_vec3 o, sdf_vec3 d, const sdf_prim_t *b, float max_t)
+{
+	/* Rotate the ray into the box's local frame. Altitude is invariant. */
+	const float dn = o.n - b->center.n;
+	const float de = o.e - b->center.e;
+
+	const float on =  b->cos_yaw * dn + b->sin_yaw * de;
+	const float oe = -b->sin_yaw * dn + b->cos_yaw * de;
+	const float oa = o.alt - b->center.alt;
+
+	const float rn =  b->cos_yaw * d.n + b->sin_yaw * d.e;
+	const float re = -b->sin_yaw * d.n + b->cos_yaw * d.e;
+	const float ra = d.alt;
+
+	const float org[3] = { on, oe, oa };
+	const float dir[3] = { rn, re, ra };
+	const float ext[3] = { b->extent.n, b->extent.e, b->extent.alt };
+
+	float t_near = 0.f;
+	float t_far  = max_t;
+
+	for (int a = 0; a < 3; ++a) {
+		if (fabsf(dir[a]) < 1e-9f) {
+			/* Parallel to this slab: miss unless already inside it. */
+			if (org[a] < -ext[a] || org[a] > ext[a]) {
+				return max_t;
+			}
+
+			continue;
+		}
+
+		const float inv = 1.f / dir[a];
+		float t0 = (-ext[a] - org[a]) * inv;
+		float t1 = (ext[a] - org[a]) * inv;
+
+		if (t0 > t1) {
+			const float tmp = t0;
+			t0 = t1;
+			t1 = tmp;
+		}
+
+		if (t0 > t_near) { t_near = t0; }
+
+		if (t1 < t_far)  { t_far  = t1; }
+
+		if (t_near > t_far) {
+			return max_t;
+		}
+	}
+
+	return t_near;
+}
+
+static float scene_prims_ray(sdf_vec3 o, sdf_vec3 d, float max_t)
+{
+	float best = max_t;
+
+	for (int i = 0; i < s_scene_count; ++i) {
+		/* Only boxes have a closed form here. Anything else stays with
+		 * the marcher, which still runs against the field below. */
+		if (s_scene[i].type != SDF_PRIM_BOX) {
+			continue;
+		}
+
+		const float t = box_ray_hit(o, d, &s_scene[i], best);
+
+		if (t < best) {
+			best = t;
+		}
+	}
+
+	return best;
 }
 
 /*============================================================================
@@ -404,6 +508,15 @@ float sdf_sphere_trace(sdf_vec3 origin, sdf_vec3 dir_unit, float max_t)
 		return -1.f;
 	}
 
+	/*
+	 * Boxes are solved exactly, then the field is marched only as far as
+	 * the nearest box. Walls stop being something the marcher has to
+	 * creep up on, so a corridor costs the same per ray as open air and
+	 * no ray can exhaust its budget and report clear air where a wall is.
+	 */
+	const float t_prim = scene_prims_ray(origin, dir_unit, max_t);
+	const float march_limit = (t_prim < max_t) ? t_prim : max_t;
+
 	float t = 0.f;
 	int   stagnant = 0;
 
@@ -414,7 +527,9 @@ float sdf_sphere_trace(sdf_vec3 origin, sdf_vec3 dir_unit, float max_t)
 			origin.alt + t * dir_unit.alt,
 		};
 
-		float d = scene_eval(p);
+		/* Field only. Boxes were already solved exactly above, so the
+		 * marcher is not competing with them for step length. */
+		float d = scene_field_sdf(p);
 
 		if (d < SDF_HIT_EPS) {
 			return t;
@@ -437,10 +552,12 @@ float sdf_sphere_trace(sdf_vec3 origin, sdf_vec3 dir_unit, float max_t)
 
 		t += step;
 
-		if (t >= max_t) {
-			return max_t;
+		if (t >= march_limit) {
+			/* Either a box is nearer than anything the field holds,
+			 * or nothing is in range at all. */
+			return march_limit;
 		}
 	}
 
-	return max_t;
+	return march_limit;
 }
