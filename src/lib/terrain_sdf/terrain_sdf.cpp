@@ -527,9 +527,21 @@ float sdf_sphere_trace(sdf_vec3 origin, sdf_vec3 dir_unit, float max_t)
 			origin.alt + t * dir_unit.alt,
 		};
 
-		/* Field only. Boxes were already solved exactly above, so the
-		 * marcher is not competing with them for step length. */
-		float d = scene_field_sdf(p);
+		/*
+		 * Step by the full scene, boxes included, even though the boxes
+		 * were already solved exactly above. The step length must stay
+		 * a lower bound on the distance to ANY surface, and the
+		 * heightfield SDF is a vertical distance rather than a
+		 * Euclidean one, so on a slope it overestimates and a longer
+		 * step can jump straight over the hillside. Dropping the boxes
+		 * from this term lengthened the step and did exactly that,
+		 * moving a terrain hit at 120.70 m out to 122.03 m.
+		 *
+		 * The exact box answer is still what gets returned, via
+		 * march_limit. This term only decides how far it is safe to
+		 * advance.
+		 */
+		float d = scene_eval(p);
 
 		if (d < SDF_HIT_EPS) {
 			return t;

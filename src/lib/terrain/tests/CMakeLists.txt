@@ -32,3 +32,15 @@
 ############################################################################
 
 px4_add_unit_gtest(SRC test_terrain.cpp LINKLIBS terrain)
+
+# Bit-exact regression harness. Both libraries are compiled into the
+# firmware, the viewer and WASM, and that only means anything if every
+# target produces identical bits, so the reference is stored as raw
+# IEEE-754 patterns rather than decimals. Regenerate with --generate only
+# when a numerical change is intended, and say so in the commit message.
+add_executable(terrain_golden_vectors
+	golden/golden_vectors.cpp
+)
+target_link_libraries(terrain_golden_vectors PRIVATE terrain terrain_sdf)
+target_include_directories(terrain_golden_vectors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME terrain_golden_vectors COMMAND terrain_golden_vectors)
