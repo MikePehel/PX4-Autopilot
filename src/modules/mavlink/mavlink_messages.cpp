@@ -94,7 +94,10 @@
 #include "streams/HYGROMETER_SENSOR.hpp"
 #include "streams/LANDING_TARGET.hpp"
 #include "streams/LOCAL_POSITION_NED.hpp"
+// constrained builds without mag processing have no mag calibration to report
+#if defined(CONFIG_SENSORS_VEHICLE_MAGNETOMETER) || !defined(CONSTRAINED_FLASH)
 #include "streams/MAG_CAL_REPORT.hpp"
+#endif
 #include "streams/MANUAL_CONTROL.hpp"
 #if defined(MAVLINK_MSG_ID_MANUAL_INPUT_STATUS)
 #include "streams/MANUAL_INPUT_STATUS.hpp"
@@ -138,6 +141,9 @@
 #ifdef MAVLINK_MSG_ID_AVAILABLE_MODES // Only defined if development.xml is used
 #include "streams/AVAILABLE_MODES.hpp"
 #include "streams/CURRENT_MODE.hpp"
+#if defined(MAVLINK_MSG_ID_SIH_TERRAIN)
+#include "streams/SIH_TERRAIN.hpp"
+#endif
 #endif
 
 #ifdef MAVLINK_MSG_ID_ESC_EEPROM // Only defined if development.xml is used
@@ -154,6 +160,7 @@
 # include "streams/GIMBAL_DEVICE_ATTITUDE_STATUS.hpp"
 # include "streams/GIMBAL_DEVICE_SET_ATTITUDE.hpp"
 # include "streams/GIMBAL_MANAGER_INFORMATION.hpp"
+# include "streams/GIMBAL_MANAGER_SET_PITCHYAW.hpp"
 # include "streams/GIMBAL_MANAGER_STATUS.hpp"
 # include "streams/GIMBAL_DEVICE_INFORMATION.hpp"
 # include "streams/GPS2_RAW.hpp"
@@ -165,6 +172,7 @@
 # include "streams/SCALED_PRESSURE3.hpp"
 # include "streams/UAVIONIX_ADSB_OUT_CFG.hpp"
 # include "streams/UAVIONIX_ADSB_OUT_DYNAMIC.hpp"
+# include "streams/WHEEL_DISTANCE.hpp"
 #endif // !CONSTRAINED_FLASH
 
 // ensure PX4 rotation enum and MAV_SENSOR_ROTATION align
@@ -364,6 +372,9 @@ static constexpr StreamListItem streams_list[] = {
 #if defined(GIMBAL_DEVICE_INFORMATION_HPP)
 	create_stream_list_item<MavlinkStreamGimbalDeviceInformation>(),
 #endif // GIMBAL_DEVICE_INFORMATION_HPP
+#if defined(GIMBAL_MANAGER_SET_PITCHYAW_HPP)
+	create_stream_list_item<MavlinkStreamGimbalManagerSetPitchyaw>(),
+#endif // GIMBAL_MANAGER_SET_PITCHYAW_HPP
 #if defined(GIMBAL_MANAGER_STATUS_HPP)
 	create_stream_list_item<MavlinkStreamGimbalManagerStatus>(),
 #endif // GIMBAL_MANAGER_STATUS_HPP
@@ -533,9 +544,16 @@ static constexpr StreamListItem streams_list[] = {
 #if defined(CURRENT_MODE_HPP)
 	create_stream_list_item<MavlinkStreamCurrentMode>(),
 #endif // CURRENT_MODE_HPP
+#if defined(SIH_TERRAIN_HPP)
+	create_stream_list_item<MavlinkStreamSihTerrain>(),
+#endif // SIH_TERRAIN_HPP
 #if defined(GLOBAL_POSITION_SENSOR_HPP)
 	create_stream_list_item<MavlinkStreamGlobalPositionSensor>(),
 #endif // GLOBAL_POSITION_SENSOR_HPP
+#if defined(WHEEL_DISTANCE_HPP)
+	create_stream_list_item<MavlinkStreamWheelDistance>(),
+#endif // WHEEL_DISTANCE_HPP
+
 };
 
 const char *get_stream_name(const uint16_t msg_id)

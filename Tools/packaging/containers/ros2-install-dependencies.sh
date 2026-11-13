@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INCLUDE_SIM_TOOLS=${1:-0}
+
 source /etc/os-release
 case "${VERSION_CODENAME}:${ROS_DISTRO}" in
     jammy:humble|noble:jazzy) ;;
@@ -17,7 +19,8 @@ rm /ros2-apt-source.deb
 apt-get update
 apt-get install -y --no-install-recommends \
     build-essential ccache cmake git ninja-build \
-    python3-empy python3-pip ros-dev-tools "ros-${ROS_DISTRO}-ros-base"
+    python3-empy python3-pip ros-dev-tools "ros-${ROS_DISTRO}-ros-base" \
+    "ros-${ROS_DISTRO}-rmw-zenoh-cpp"
 
 # Keep Ubuntu/ROS Python packages while satisfying PX4's shared requirements.
 # Distro-only versions (e.g. ubuntu suffixes) cannot be pip constraints.
@@ -34,15 +37,20 @@ for dist in distributions():
         continue
     print(f"{dist.metadata['Name']}=={dist.version}")
 PY
+if [ "${INCLUDE_SIM_TOOLS}" -eq 0 ]; then
+    extra_args="--no-sim-tools"
+else
+    extra_args=""
+fi
 RUNS_IN_DOCKER=true PIP_CONSTRAINT=/px4-python-constraints.txt PIP_NO_CACHE_DIR=1 \
-    bash /px4-setup/ubuntu.sh --no-nuttx --no-sim-tools
+    bash /px4-setup/ubuntu.sh --no-nuttx ${extra_args}
 rm /px4-python-constraints.txt
 
 rosdep init
 rosdep update --rosdistro "${ROS_DISTRO}"
-if [ "$#" -gt 0 ]; then
+if [ "$#" -gt 1 ]; then
     # ROS setup scripts are not nounset-safe.
     set +u
     source "/opt/ros/${ROS_DISTRO}/setup.bash"
-    rosdep install --from-paths "$1" --ignore-src --rosdistro "${ROS_DISTRO}" -y
+    rosdep install --from-paths "$2" --ignore-src --rosdistro "${ROS_DISTRO}" -y
 fi

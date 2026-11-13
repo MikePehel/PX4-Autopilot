@@ -272,9 +272,7 @@ private:
 class I2CSPIDriverBase : public px4::ScheduledWorkItem, public I2CSPIInstance
 {
 public:
-	I2CSPIDriverBase(const I2CSPIDriverConfig &config)
-		: ScheduledWorkItem(config.module_name, config.wq_config),
-		  I2CSPIInstance(config) {}
+	I2CSPIDriverBase(const I2CSPIDriverConfig &config);
 
 	static int module_stop(BusInstanceIterator &iterator);
 	static int module_status(BusInstanceIterator &iterator);
@@ -301,6 +299,14 @@ protected:
 	static int module_start(const BusCLIArguments &cli, BusInstanceIterator &iterator, void(*print_usage)(),
 				instantiate_method instantiate);
 
+	/**
+	 * Handle the start, stop and status verbs, or print the usage for any other verb.
+	 */
+	static int module_main(const char *verb, const BusCLIArguments &cli, BusInstanceIterator &iterator,
+			       void(*print_usage)(), instantiate_method instantiate);
+
+	static I2CSPIDriverBase *init_instance(I2CSPIDriverBase *instance, int init_ret);
+
 private:
 	static void custom_method_trampoline(void *argument);
 
@@ -321,6 +327,11 @@ public:
 	static int module_start(const BusCLIArguments &cli, BusInstanceIterator &iterator)
 	{
 		return I2CSPIDriverBase::module_start(cli, iterator, &T::print_usage, InstantiateHelper<T>::m);
+	}
+
+	static int module_main(const char *verb, const BusCLIArguments &cli, BusInstanceIterator &iterator)
+	{
+		return I2CSPIDriverBase::module_main(verb, cli, iterator, &T::print_usage, InstantiateHelper<T>::m);
 	}
 
 protected:
@@ -356,17 +367,6 @@ private:
 	static I2CSPIDriverBase *instantiate_default(const I2CSPIDriverConfig &config, int runtime_instance)
 	{
 		T *instance = new T(config);
-
-		if (!instance) {
-			PX4_ERR("alloc failed");
-			return nullptr;
-		}
-
-		if (OK != instance->init()) {
-			delete instance;
-			return nullptr;
-		}
-
-		return instance;
+		return I2CSPIDriverBase::init_instance(instance, instance ? instance->init() : PX4_ERROR);
 	}
 };

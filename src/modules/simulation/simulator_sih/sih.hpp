@@ -55,6 +55,9 @@
  */
 #pragma once
 
+#include <lib/terrain_sim/terrain_sim.h>
+#include <mathlib/math/WhiteGaussianNoise.hpp>
+#include <px4_platform_common/atomic.h>
 #include <px4_platform_common/module.h>
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/posix.h>
@@ -79,15 +82,21 @@
 #include <uORB/topics/failure_injection.h>
 #include <uORB/topics/esc_status.h>
 #include <uORB/topics/parameter_update.h>
+#include <uORB/topics/sensor_optical_flow.h>
+#include <uORB/topics/sih_terrain.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_global_position.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/ranging_beacon.h>
 
+#include "terrain/TerrainSynthetic.hpp"
+
 #if defined(ENABLE_LOCKSTEP_SCHEDULER)
 #include <sys/time.h>
 #endif
+
+#include "terrain/Terrain.hpp"
 
 using namespace time_literals;
 
@@ -120,22 +129,27 @@ public:
 	/** @see ModuleBase::run() */
 	void run() override;
 
-	static float generate_wgn();    // generate white Gaussian noise sample
+	// anchor for the range noise law, the spread at 25 m over grass
+	// set it to your rangefinder's figure and the square law scales the rest
+	static constexpr float kDistSnsrNoiseAt25M = 0.10f;
 
-	// generate white Gaussian noise sample as a 3D vector with specified std
-	static matrix::Vector3f noiseGauss3f(float stdx, float stdy, float stdz);
+	// white Gaussian noise sample with std=1 for the distance sensor, on its own generator
+	static float generate_wgn();
 
 private:
 	void parameters_updated();
+	void publish_terrain();
 	void updateFailureConfig();
 
 	// simulated sensors
 	PX4Accelerometer _px4_accel{1310988}; // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
 	PX4Gyroscope     _px4_gyro{1310988};  // 1310988: DRV_IMU_DEVTYPE_SIM, BUS: 1, ADDR: 1, TYPE: SIMULATION
 	PX4Rangefinder   _px4_rangefinder{10092548}; // 10092548: DRV_DIST_DEVTYPE_SIM, BUS: 0, ADDR: 0, TYPE: SIMULATION
-	uORB::Publication<airspeed_s>         _airspeed_pub{ORB_ID(airspeed)};
-	uORB::Publication<ranging_beacon_s>   _ranging_beacon_pub{ORB_ID(ranging_beacon)};
-	uORB::Publication<esc_status_s>       _esc_status_pub{ORB_ID(esc_status)};
+	uORB::Publication<airspeed_s>            _airspeed_pub{ORB_ID(airspeed)};
+	uORB::Publication<ranging_beacon_s>      _ranging_beacon_pub{ORB_ID(ranging_beacon)};
+	uORB::Publication<esc_status_s>          _esc_status_pub{ORB_ID(esc_status)};
+	uORB::Publication<sensor_optical_flow_s> _optical_flow_pub{ORB_ID(sensor_optical_flow)};
+	uORB::Publication<sih_terrain_s>         _sih_terrain_pub{ORB_ID(sih_terrain)};
 
 	// groundtruth
 	uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -149,8 +163,10 @@ private:
 
 	bool _airspeed_blocked{false};
 	bool _distance_sensor_blocked{false};
+	bool _optical_flow_blocked{false};
 	bool _accel_blocked{false};
 	bool _gyro_blocked{false};
+	uint16_t _stuck_motor_mask{0};
 
 	// hard constants
 	static constexpr uint16_t NUM_ACTUATORS_MAX = 9;
@@ -178,6 +194,16 @@ private:
 	};
 	RangingBeaconConfig _ranging_beacons[NUM_RANGING_BEACONS] {};
 
+	// Distance sensor simulation constants
+	// fraction of the measurement range above which the returned signal starts to get weaker
+	static constexpr float DISTSNSR_QUALITY_DERATE = 0.8f;
+	// out of range reading, this is based on lightware lw20 behaviour
+	static constexpr float DISTSNSR_OUT_OF_RANGE = UINT16_MAX / 100.f;
+
+	// Optical flow simulation constants, the values are taken from the PAW3902
+	static constexpr float FLOW_MAX_RATE = 7.4f;   // maximum measurable angular flow rate [rad/s]
+	static constexpr float FLOW_MIN_DISTANCE = 0.1f; // lower bound on the range scaling the flow [m]
+
 	static constexpr float T1_C = 15.0f;                        // ground temperature in Celsius
 	static constexpr float T1_K = T1_C - atmosphere::kAbsoluteNullCelsius;   // ground temperature in Kelvin
 	static constexpr float TEMP_GRADIENT = -6.5f / 1000.0f;    // temperature gradient in degrees per metre
@@ -192,6 +218,8 @@ private:
 	void read_motors(const float dt);
 	void publish_esc_status();
 	uint8_t num_motors() const;
+	// motor number (Motor1 = 0) driven by an actuator channel, or -1 for control surfaces and steering channels
+	int motor_index_from_actuator(int actuator_index) const;
 
 	// generate the motors thrust and torque in the body frame
 	void generate_force_and_torques(const float dt);
@@ -203,7 +231,10 @@ private:
 	void reconstruct_sensors_signals(const hrt_abstime &time_now_us);
 	void send_airspeed(const hrt_abstime &time_now_us);
 	void send_dist_snsr(const hrt_abstime &time_now_us);
+	void accumulate_optical_flow(const float dt);
+	void send_optical_flow(const hrt_abstime &time_now_us);
 	void send_ranging_beacon(const hrt_abstime &time_now_us);
+
 	void publish_ground_truth(const hrt_abstime &time_now_us);
 	void generate_fw_aerodynamics(const float roll_cmd, const float pitch_cmd, const float yaw_cmd, const float thrust_for_prowash);
 	void generate_ts_aerodynamics();
@@ -212,8 +243,43 @@ private:
 
 	void ecefToNed();
 
+#if defined(__PX4_POSIX)
+	// orient command: poses the vehicle on the ground for accel and mag calibration.
+	// SITL only: Commander denies sensor calibration when SIH runs on flight controller hardware.
+	void orient_update(const hrt_abstime &now);
+	void orient_step(const hrt_abstime &now, const float dt);
+
+	static constexpr int ORIENT_SIDE_COUNT = 6;
+	static constexpr int ORIENT_NONE = -1;	// no request
+	static constexpr int ORIENT_OFF = ORIENT_SIDE_COUNT;
+	static constexpr int ORIENT_ALL = ORIENT_SIDE_COUNT + 1;
+	static constexpr int ORIENT_ROTATE = 8;	// added to a side
+
+	enum class OrientMode {Off, Hold, Rotate, AllSides, Leveling};
+
+	px4::atomic_int _orient_request{ORIENT_NONE};	// set by the CLI, taken by the simulation loop
+	OrientMode _orient_mode{OrientMode::Off};
+	int _orient_side{0};
+	hrt_abstime _orient_start{0};
+	float _orient_yaw{0.f};	// heading kept while posing
+#endif // __PX4_POSIX
+
+	// distance from the vehicle to the terrain measured along the body down axis, NAN if the
+	// body down axis does not point at the ground or nothing is hit within max_distance
+	float ground_distance(float max_distance) const;
+
+	// terrain from the start arguments: the -t DEM, flat without it
+	// false (and print the reason) on error or if the vehicle type does not support terrain
+	static bool load_terrain(int argc, char *argv[]);
+
+	static inline Terrain _terrain{}; // loaded by task_spawn(), the SIH task stack is too small for the terrain libraries
+	static inline TerrainSynthetic _synthetic{}; // terrain from SIH_TERR_SEED
+	static inline TerrainFlat _flat{}; // flat ground at the reference altitude
+	TerrainFlat *_ground{&_flat}; // the ground in force, chosen by SIH_TERR_MODE: flat, the elevation data from the file, or the synthetic terrain
+
 #if defined(ENABLE_LOCKSTEP_SCHEDULER)
 	void lockstep_loop();
+	int _lockstep_component{-1};
 	uint64_t _current_simulation_time_us{0};
 	float _achieved_speedup{0.f};
 #endif
@@ -230,8 +296,16 @@ private:
 	hrt_abstime _last_actuator_output_time{0};
 	hrt_abstime _airspeed_time{0};
 	hrt_abstime _dist_snsr_time{0};
+	hrt_abstime _terrain_time{0};
 	hrt_abstime _ranging_beacon_time{0};
 	uint8_t _ranging_beacon_idx{0};
+
+	// optical flow accumulation over one integration interval
+	hrt_abstime _optical_flow_time{0};
+	matrix::Vector2f _optical_flow_integral{};
+	float _optical_flow_dt{0.f};
+	bool _optical_flow_tracking{true};
+	uint32_t _optical_flow_device_id{0};
 
 	bool _grounded{true}; // whether the vehicle is on the ground
 
@@ -306,15 +380,22 @@ private:
 	// parameters
 	MapProjection _lpos_ref{};
 	float _lpos_ref_alt;
+	float _ground_alt{0.f};  // ground altitude below the vehicle [m AMSL]
 	float _MASS, _T_MAX, _Q_MAX, _L_ROLL, _L_PITCH, _KDV, _KDW, _T_TAU, _F_T_MAX, _F_Q_MAX;
 	matrix::Matrix3f _I;    // vehicle inertia matrix
 	matrix::Matrix3f _Im1;  // inverse of the inertia matrix
 
-	float _distance_snsr_min, _distance_snsr_max, _distance_snsr_override;
+	float _distance_snsr_min, _distance_snsr_max, _distance_snsr_override, _distance_snsr_noise;
+	hrt_abstime _optical_flow_interval_us{20_ms};
+	terrain_sim::RangefinderFaults _faults{};
 
 	esc_status_s _esc_status{};
 
 	// parameters defined in sih_params.c
+	static constexpr int32_t TERR_MODE_FLAT = 0;      // SIH_TERR_MODE values
+	static constexpr int32_t TERR_MODE_DEM = 1;       // terrain from the elevation data file given with -t
+	static constexpr int32_t TERR_MODE_SYNTHETIC = 2; // synthetic terrain from SIH_TERR_SEED
+
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::IMU_GYRO_RATEMAX>) _imu_gyro_ratemax,
 		(ParamInt<px4::params::IMU_INTEG_RATE>) _imu_integration_rate,
@@ -335,9 +416,17 @@ private:
 		(ParamFloat<px4::params::SIH_LOC_LON0>) _sih_lon0,
 		(ParamFloat<px4::params::SIH_LOC_H0>) _sih_h0,
 		(ParamFloat<px4::params::SIH_LOC_YAW0>) _sih_yaw0,
+		(ParamInt<px4::params::SIH_DISTSNSR_EN>) _sih_distance_snsr_en,
 		(ParamFloat<px4::params::SIH_DISTSNSR_MIN>) _sih_distance_snsr_min,
 		(ParamFloat<px4::params::SIH_DISTSNSR_MAX>) _sih_distance_snsr_max,
 		(ParamFloat<px4::params::SIH_DISTSNSR_OVR>) _sih_distance_snsr_override,
+		(ParamFloat<px4::params::SIH_DISTSNSR_NOI>) _sih_distance_snsr_noise,
+		(ParamInt<px4::params::SIH_OF_EN>) _sih_optical_flow_en,
+		(ParamFloat<px4::params::SIH_OF_RATE>) _sih_optical_flow_rate,
+		(ParamFloat<px4::params::SIH_OF_NOISE>) _sih_optical_flow_noise,
+		(ParamFloat<px4::params::SIH_OF_H_MAX>) _sih_optical_flow_h_max,
+		(ParamInt<px4::params::SIH_TERR_MODE>) _sih_terr_mode,
+		(ParamInt<px4::params::SIH_TERR_SEED>) _sih_terr_seed,
 		(ParamFloat<px4::params::SIH_T_TAU>) _sih_thrust_tau,
 		// forward propeller
 		(ParamFloat<px4::params::SIH_F_T_MAX>) _sih_f_thrust_max,
